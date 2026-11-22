@@ -261,14 +261,19 @@ fn stage(source: &Path, slot: &Path) -> io::Result<Guard> {
     lock.try_lock().map_err(io::Error::other)?;
     let game = slot.join("game");
     plain_directory(&game)?;
-    // Asked before the guard below holds the version's exe, since a linked image answers it too.
-    replaceable(&game.join(crate::backend::CLIENT))?;
-    // Before that guard opens the version's own exe: the handle shares no write, so it would
-    // refuse this replacement of the slot name itself.
-    place(
-        &source.join(crate::backend::CLIENT),
-        &game.join(crate::backend::CLIENT),
-    )?;
+    let program = game.join(crate::backend::CLIENT);
+    let installed = source.join(crate::backend::CLIENT);
+    // A slot that already links the version's own exe has nothing to replace. Every home that
+    // plays this version links the same file, so a game in one of them, or its guard below, would
+    // refuse the write test and fail the Play of another home. Only a slot that must change its
+    // exe asks whether a game still runs it, and does so before the guard below holds the
+    // version's exe, since a linked image answers that too.
+    if !same_file(&installed, &program) {
+        replaceable(&program)?;
+        // Before that guard opens the version's own exe: the handle shares no write, so it would
+        // refuse this replacement of the slot name itself.
+        relink(&installed, &program)?;
+    }
     // Retain the original exe's protection against deletion/rebuild while playing.
     let source_file = fs::OpenOptions::new()
         .read(true)
@@ -634,7 +639,21 @@ mod tests {
         drop(guard); // Simulate a launcher exiting before its game.
         let running = child.try_wait().unwrap().is_none();
         let protected = in_use_in(&source, &root.join("run"));
-        let replacement = prepare_in(&cmd, &root.join("run"));
+        // Another version in the same slot would replace the program the orphan still runs.
+        let newer = root.join("newer");
+        fs::create_dir_all(&newer).unwrap();
+        fs::copy(
+            Path::new(&std::env::var_os("SystemRoot").unwrap()).join("System32/cmd.exe"),
+            newer.join(crate::backend::CLIENT),
+        )
+        .unwrap();
+        let mut update = Command::new(newer.join(crate::backend::CLIENT));
+        update
+            .current_dir(&root)
+            .args(["/D", "/C", "set /p answer="]);
+        crate::run_leases::mark(&mut update, &newer);
+        let update = redirect_in(update, &root.join("run"));
+        let replacement = prepare_in(&update, &root.join("run"));
         let _ = child.kill();
         child.wait().unwrap();
         assert!(running && protected);
@@ -696,6 +715,54 @@ mod tests {
             fs::read_to_string(unrelated.join("keep.txt")).unwrap(),
             "player data"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_home_can_play_while_another_home_runs_the_same_version() {
+        let root = std::env::temp_dir().join(format!("horizon-two-homes-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("version");
+        fs::create_dir_all(&source).unwrap();
+        fs::copy(
+            Path::new(&std::env::var_os("SystemRoot").unwrap()).join("System32/cmd.exe"),
+            source.join(crate::backend::CLIENT),
+        )
+        .unwrap();
+        // Without hard links each slot holds a copy of its own and the homes never meet.
+        if fs::hard_link(source.join(crate::backend::CLIENT), root.join("probe.dll")).is_err() {
+            return;
+        }
+        fs::remove_file(root.join("probe.dll")).unwrap();
+        let command = |name: &str| {
+            let home = root.join(name);
+            fs::create_dir_all(&home).unwrap();
+            let mut cmd = Command::new(source.join(crate::backend::CLIENT));
+            cmd.current_dir(&home)
+                .env("HORIZON_HOME", &home)
+                .args(["/D", "/C", "set /p answer="]);
+            crate::run_leases::mark(&mut cmd, &source);
+            redirect_in(cmd, &root.join("run"))
+        };
+        let (a, b) = (command("home-a"), command("home-b"));
+        assert_ne!(a.get_program(), b.get_program());
+        // Home b has played this version before, so its slot already links the version's exe.
+        drop(prepare_in(&b, &root.join("run")).unwrap().unwrap());
+        let playing = prepare_in(&a, &root.join("run")).unwrap().unwrap();
+        let mut running = Command::new(a.get_program());
+        running
+            .current_dir(&root)
+            .args(["/D", "/C", "set /p answer="])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null());
+        crate::process::hide_console(&mut running);
+        let mut child = running.spawn().unwrap();
+        // Home a plays, so the version's exe is open for running and held by its guard.
+        let second = prepare_in(&b, &root.join("run"));
+        let _ = child.kill();
+        child.wait().unwrap();
+        drop(playing);
+        assert!(second.is_ok(), "home b refused: {:?}", second.err());
         fs::remove_dir_all(root).unwrap();
     }
 }
