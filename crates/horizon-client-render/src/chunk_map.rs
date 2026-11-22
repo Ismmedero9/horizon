@@ -484,6 +484,31 @@ impl ChunkMap {
         }
         previous
     }
+    /// Makes the grid serve the column at `key`, which is in `columns` already (what `insert` does after it adds
+    /// one): a map that was lent chunks, or got them back, reads them by `get` like any other.
+    fn cache_slot(&mut self, key: Key) {
+        let Some(cached) = self.columns.get(&key).map(Arc::clone) else {
+            return;
+        };
+        if self.grid_mask == 0 {
+            self.rebuild_grid(4);
+        } else if self.columns.len() > 2048 && self.grid_shift < 7 {
+            self.rebuild_grid(7);
+        } else if self.columns.len() > 128 && self.grid_shift < 6 {
+            self.rebuild_grid(6);
+        } else {
+            let idx = self.grid_idx(key.0, key.1);
+            let packed = pack_key(key.0, key.1);
+            let slot = &mut self.grid[idx];
+            if slot.chunk.is_some() && slot.key_packed != packed {
+                self.grid_complete = false;
+            }
+            *slot = CachedSlot {
+                key_packed: packed,
+                chunk: Some(cached),
+            };
+        }
+    }
     pub fn remove(&mut self, key: &Key) -> Option<Arc<Chunk>> {
         self.touch(*key);
         self.fresh.remove(key);
@@ -588,9 +613,11 @@ impl ChunkMap {
                 part
             })
             .collect();
+        let mut gone = Vec::new();
         let (fresh, near) = (&mut self.fresh, &self.near);
         let mut take = |key: Key, chunk: Arc<Chunk>| {
             let r = region_of(key).expect("extracted for its region");
+            gone.push(key);
             if fresh.remove(&key) {
                 out[r].fresh.insert(key);
             }
@@ -600,6 +627,7 @@ impl ChunkMap {
                 out[r].near.insert(key, n);
             }
             out[r].columns.insert(key, chunk);
+            out[r].cache_slot(key);
         };
         match scope {
             // Only the chunks of `scope` can go: each is looked up, the map is not walked.
@@ -618,6 +646,11 @@ impl ChunkMap {
                 }
             }
         }
+        // The grid kept a handle on each: a lent column must read as absent here, and a handle left behind would
+        // also make the region's first write copy the whole column.
+        for key in gone {
+            self.invalidate_slot(key);
+        }
         out
     }
     /// The chunks [`ChunkMap::lend`] lent, back (a region's tick never loads or drops a chunk).
@@ -633,7 +666,10 @@ impl ChunkMap {
             }
         }
         self.fresh.extend(lent.fresh.drain());
-        self.columns.extend(lent.columns.drain());
+        for (key, chunk) in lent.columns.drain() {
+            self.columns.insert(key, chunk);
+            self.cache_slot(key);
+        }
     }
     pub fn values_mut(&mut self) -> ValuesMut<'_, Key, Arc<Chunk>> {
         self.touch_all();
@@ -965,6 +1001,32 @@ mod tests {
         assert_eq!(keys(&by_scope[0]), keys(&by_walk[0]));
         assert_eq!(keys(&scoped), keys(&walked));
         assert_eq!(keys(&scoped), [(0, 0), (1, 0), (6, 0), (7, 0)]);
+        // The lookup grid agrees with the columns on both sides.
+        assert!(by_scope[0].get(&(3, 0)).is_some() && scoped.get(&(3, 0)).is_none());
+        assert!(scoped.get(&(1, 0)).is_some());
+    }
+
+    #[test]
+    fn lent_columns_read_by_get_where_they_are_and_nowhere_else() {
+        let mut map = ChunkMap::default();
+        for x in 0..4 {
+            map.insert((x, 0), Arc::new(Chunk::empty(x, 0)));
+        }
+        let mut parts = map.lend(2, |(x, _)| Some((x / 2) as usize), None);
+        // A lent column is gone from the map it left, whatever its lookup grid remembers, and found in the map it
+        // went to.
+        assert!(map.get(&(0, 0)).is_none());
+        assert!(!map.contains_key(&(3, 0)));
+        assert!(parts[0].get(&(1, 0)).is_some());
+        assert!(parts[0].get(&(2, 0)).is_none());
+        assert!(parts[1].contains_key(&(3, 0)));
+        // A column a region edits is the edited one when it comes back, by `get` too.
+        Arc::make_mut(parts[1].get_mut(&(3, 0)).unwrap()).lit = true;
+        for part in parts {
+            map.take_back(part);
+        }
+        assert!(map.get(&(3, 0)).unwrap().lit);
+        assert!(!map.get(&(0, 0)).unwrap().lit);
     }
 
     #[test]
