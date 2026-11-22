@@ -2038,7 +2038,12 @@ mod tests {
         teleport(1, [100.0, 64.0, 200.0], 10.0, 0);
         // 64 more, each one block east and turned by 2: with the first, 65 are sent.
         for id in 2..=65 {
-            teleport(id, [1.0, 0.0, 0.0], 2.0, rel::X | rel::Y | rel::Z | rel::Y_ROT);
+            teleport(
+                id,
+                [1.0, 0.0, 0.0],
+                2.0,
+                rel::X | rel::Y | rel::Z | rel::Y_ROT,
+            );
         }
         let mut w = Writer::new();
         w.varint(65);
