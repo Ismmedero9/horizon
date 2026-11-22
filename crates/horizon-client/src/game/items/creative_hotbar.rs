@@ -76,6 +76,10 @@ impl Game<'_> {
             for (slot, stack) in rows[index].iter().enumerate() {
                 self.inventory[slot] = stack.clone();
             }
+            // handleHotbarLoadOrSave: `broadcastChanges` sends the loaded slots at once.
+            if self.remote.is_some() {
+                self.send_creative_slots();
+            }
             return;
         }
         rows[index] = self.inventory[..hotbar::SIZE].to_vec();

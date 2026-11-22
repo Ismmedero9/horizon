@@ -323,6 +323,9 @@ impl Game<'_> {
             damage,
             extra,
         });
+        if self.remote.is_some() {
+            self.send_creative_slots();
+        }
     }
     /// The tables, made on the first call; none while the world resources
     /// they come from are still loading behind the title on a slow start.

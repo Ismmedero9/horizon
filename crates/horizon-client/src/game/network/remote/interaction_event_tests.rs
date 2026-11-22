@@ -1603,6 +1603,30 @@ fn a_creative_hand_replaced_by_a_finish_listener_is_not_sent_as_a_creative_slot(
     });
 }
 
+/// `CreativeInventoryListener` is attached only while the creative screen is open, so a stack
+/// this client changed by itself with the screen closed (a pickup, a use-to-equip swap) is not
+/// an edit to send; the server's slot updates decide. With the screen open it is sent.
+#[test]
+#[ignore = "daily"]
+fn a_closed_creative_screen_sends_no_creative_slot_for_a_local_change() {
+    with_interaction_game(true, |game| {
+        game.creative = true;
+        game.screen = crate::game::Screen::Playing;
+        game.remote_synced();
+        game.inventory[3] = Some(ItemStack::new("minecraft:elytra", 1));
+        game.remote_send_state(0);
+        // Marked synced, so opening the screen later does not send it either.
+        assert_eq!(game.creative_stacks()[3], game.remote.as_ref().unwrap().synced[3]);
+        game.screen = crate::game::Screen::Creative;
+        game.send_creative_slots();
+        assert_eq!(game.remote.as_ref().unwrap().synced[3], game.creative_stacks()[3]);
+        // With the screen open a change is an edit: it becomes synced by being sent.
+        game.inventory[4] = Some(ItemStack::new("minecraft:stone", 5));
+        game.remote_send_state(0);
+        assert_eq!(game.remote.as_ref().unwrap().synced[4], game.inventory[4]);
+    });
+}
+
 #[path = "interaction_key_tests.rs"]
 mod interaction_key_tests;
 #[path = "mapping_press_tests.rs"]

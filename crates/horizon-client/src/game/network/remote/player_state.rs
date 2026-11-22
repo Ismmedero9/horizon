@@ -213,7 +213,11 @@ impl Game<'_> {
             // A server's open menu takes clicks, which it applies itself: what
             // this client predicts for them isn't an edit to send (it would
             // overwrite the server's stacks whenever the prediction is wrong).
-            let in_menu = r.menu.as_ref().is_some();
+            // Vanilla sends these only from `CreativeInventoryListener`, which
+            // `CreativeModeInventoryScreen` attaches while it is open. With it closed,
+            // what this client predicts (a pickup, a use-to-equip swap) is the server's
+            // to confirm: it is marked synced and the server's slot updates win.
+            let in_menu = r.menu.as_ref().is_some() || self.screen != Screen::Creative;
             let stacks = creative_sync_stacks(&self.inventory, &self.offhand, &self.armor);
             for (i, stack) in stacks.into_iter().enumerate() {
                 if stack != r.synced[i] {
