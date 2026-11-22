@@ -26,7 +26,7 @@ fn game() -> Game<'static> {
 fn guest_texts(
     receiver: &std::sync::mpsc::Receiver<horizon_client::lan::Out>,
 ) -> (Vec<String>, Vec<String>) {
-    let plain = |tag: &horizon_world::nbt::Tag| {
+    let plain = |tag: &horizon_core::nbt::Tag| {
         let json = horizon_client::scoreboard::tag_to_json(tag);
         horizon_client::component::to_text(&json, &mut |s| Text::literal(s)).plain()
     };
@@ -133,6 +133,7 @@ fn a_title_score_wildcard_is_the_target_it_is_sent_to() {
             max_players: 2,
             integrated: false,
             levels: Default::default(),
+            level_seeds: Default::default(),
         },
     )
     .unwrap();
@@ -149,7 +150,6 @@ fn a_title_score_wildcard_is_the_target_it_is_sent_to() {
             latency: Arc::new(AtomicI32::new(0)),
             address: "127.0.0.1:25565".parse().unwrap(),
             expected: false,
-            configured: Default::default(),
         },
         1002,
         [2.5, 200.0, 0.5],
