@@ -1016,6 +1016,10 @@ impl Game<'_> {
         w.maps.last_id = Some(base);
         w.maps.lent_base = base;
     }
+    /// A region game made a map since it was lent (its data is the server's to save).
+    pub(super) fn region_maps_made(&self) -> bool {
+        self.maps.data.keys().any(|id| *id > self.maps.lent_base)
+    }
     /// The maps region game `w` made while it was lent (their data is the server's to save) and its ids.
     pub(super) fn take_maps_back(&mut self, w: &mut Game<'_>) {
         let base = w.maps.lent_base;

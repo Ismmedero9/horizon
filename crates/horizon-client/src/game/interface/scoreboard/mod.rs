@@ -72,6 +72,32 @@ pub(super) struct ScoreState {
     lent_board: Option<Scoreboard>,
 }
 
+impl ScoreState {
+    /// The board differs from the copy lent to this region game.
+    fn changed_since_lent(&self) -> bool {
+        self.lent_board
+            .as_ref()
+            .is_some_and(|lent| self.board != *lent)
+    }
+}
+
+#[cfg(test)]
+mod lent_board_tests {
+    use super::*;
+
+    /// A region game asks to come home for scores its players changed, and only for those.
+    #[test]
+    fn only_a_changed_score_asks_a_region_home() {
+        let mut state = ScoreState::default();
+        state.board.score_mut("alex", "kills").value = 1;
+        assert!(!state.changed_since_lent(), "a game that holds no lent board");
+        state.lent_board = Some(state.board.clone());
+        assert!(!state.changed_since_lent());
+        state.board.score_mut("alex", "kills").value = 2;
+        assert!(state.changed_since_lent());
+    }
+}
+
 fn in_range(v: i32, (lo, hi): IntRange) -> bool {
     lo.is_none_or(|l| v >= l) && hi.is_none_or(|h| v <= h)
 }
@@ -166,6 +192,10 @@ impl Game<'_> {
     }
     /// The scores region game `w` changed while the region was out (its players' criteria scores) are the
     /// server's now; the server's own board is otherwise the only one, so its objectives and teams stand.
+    /// A region game's players changed a score since the board was lent (`merge_region_scores` takes it home).
+    pub(super) fn region_scores_changed(&self) -> bool {
+        self.score.changed_since_lent()
+    }
     pub(super) fn merge_region_scores(&mut self, w: &mut Game<'_>) {
         let Some(lent) = w.score.lent_board.take() else {
             return;

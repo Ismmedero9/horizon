@@ -283,6 +283,9 @@ pub(super) struct RegionState {
     factory: Vec<std::sync::mpsc::Receiver<std::result::Result<Box<Game<'static>>, String>>>,
     /// Each level's resident regions: their games keep their parts of the level and their players.
     pub resident: std::collections::HashMap<Dim, ResidentSet>,
+    /// This region game holds something only the server's thread can take in (scores or maps it changed): it comes
+    /// home at the next tick ([`Game::region_housekeeping`]).
+    pub(super) home_wanted: bool,
     /// A level's resident regions started before its server-side work, waited for by its world tick.
     flight: Option<(Dim, Flight)>,
     /// The regions just came home for nothing the server's thread has to do (their age, a player near the edge
@@ -430,20 +433,30 @@ fn region_deadline() -> std::time::Duration {
     }))
 }
 
-/// Ticks between the resident regions' returns (`HORIZON_RESIDENT_TICKS`, 20 by default).
+/// Ticks between the resident regions' returns (`HORIZON_RESIDENT_TICKS`). 0, the default, is on demand only: a
+/// region stays out until something needs the server's thread (a command, a packet that reaches past it, a
+/// player leaving its area, scores or maps it changed, a raid), and the level is split anew only when the layout
+/// has to change or after [`LAYOUT_REFRESH_TICKS`]. A number above 0 brings every region home that often.
 fn resident_period() -> u32 {
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("HORIZON_RESIDENT_TICKS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(20)
-            .max(1)
+            .unwrap_or(0)
     })
 }
 
 /// Ticks of `resident_period` between the resident set coming home whole to be split anew.
 const RESIDENT_REFRESH: u32 = 10;
+
+/// With regions on demand only, the longest a set stays out before it comes home whole to be split anew: a
+/// safety net for what has no trigger of its own (the ticking chunks changing, the entity id counter growing).
+const LAYOUT_REFRESH_TICKS: u32 = 12_000;
+
+/// Ticks between the checks a region game makes of what it holds for the server (scores, maps, memory of
+/// entities that are gone) while it stays out: [`Game::region_housekeeping`].
+const REGION_HOUSEKEEPING_TICKS: i64 = 20;
 
 /// Which resident regions have to come home: all of them, or those named (with the reason).
 enum Land {
@@ -454,7 +467,11 @@ enum Land {
 /// Whether region game `w` has something for the server's thread, so its region must come back: commands, menus
 /// of native mods, a player dead or leaving, a raid (`region_raids_want_home`).
 fn wants_land(w: &Game<'_>) -> bool {
-    if !w.level_teleports.is_empty() || !w.server_trips.is_empty() || w.region_raids_want_home() {
+    if w.regions.home_wanted
+        || !w.level_teleports.is_empty()
+        || !w.server_trips.is_empty()
+        || w.region_raids_want_home()
+    {
         return true;
     }
     let Some(h) = w.lan.as_ref() else {
@@ -796,6 +813,7 @@ impl Game<'_> {
         // What the region remembers of entities that died there dies with them, before it is handed back: a
         // stale record would outlive its id and be inherited by whichever entity reuses it.
         w.prune_entity_memory();
+        w.regions.home_wanted = false;
         self.merge_region_scores(w);
         self.take_maps_back(w);
         self.take_raids_back(w);
@@ -1447,7 +1465,11 @@ impl Game<'_> {
             return Some(Land::All("no host"));
         };
         // The whole set is split anew now and then: the layout follows the players and the ticking chunks.
-        if set.age >= resident_period() * RESIDENT_REFRESH {
+        let refresh = match resident_period() {
+            0 => LAYOUT_REFRESH_TICKS,
+            n => n * RESIDENT_REFRESH,
+        };
+        if set.age >= refresh {
             return Some(Land::All("age"));
         }
         let slot_of = |conn: u32| set.games.iter().position(|s| s.conns.contains(&conn));
@@ -1510,7 +1532,7 @@ impl Game<'_> {
             }
             if wants_land(w) {
                 add(k, "region wants");
-            } else if s.age >= resident_period() {
+            } else if resident_period() > 0 && s.age >= resident_period() {
                 add(k, "region age");
             }
         }
@@ -1776,6 +1798,13 @@ impl Game<'_> {
         let Some(pool) = self.regions.entity_pool.clone() else {
             return;
         };
+        // Winding back gives every game a fresh block at its next lend, so the counter climbs by a block per
+        // region and cycle (the highest game's block stays the floor): with landings on demand a level splits
+        // anew often enough while players join to run it out of ids. Games keep their blocks instead, and
+        // the counter is wound back only when it is past half of the range.
+        if pool.load(Ordering::Relaxed) < u32::MAX / 2 {
+            return;
+        }
         let mut high = self.next_entity;
         for game in self.regions.idle.values().flatten() {
             high = high.max(game.next_entity);
@@ -2013,7 +2042,27 @@ impl Game<'_> {
         let sky_light = self.streaming.sky_light;
         self.streaming
             .relight_region_edits(&mut self.world, sky_light, REGION_RELIGHT_PER_TICK);
+        self.region_housekeeping();
         Ok(())
+    }
+
+    /// What a region that stays out holds for the server and nothing else delivers, looked at every
+    /// [`REGION_HOUSEKEEPING_TICKS`] ticks on the region's own thread: scores its players changed and maps they
+    /// made ask the region to come home (the server merges them in [`Game::take_region_back`]); the memory kept
+    /// for entities that are gone is dropped here, as a landing did.
+    fn region_housekeeping(&mut self) {
+        if self.world.game_time % REGION_HOUSEKEEPING_TICKS != 0 {
+            return;
+        }
+        if self.regions.home_wanted {
+            return;
+        }
+        if self.world.game_time % (REGION_HOUSEKEEPING_TICKS * 5) == 0 {
+            self.prune_entity_memory();
+        }
+        if self.region_scores_changed() || self.region_maps_made() {
+            self.regions.home_wanted = true;
+        }
     }
 }
 

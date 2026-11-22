@@ -1915,8 +1915,12 @@ impl Game<'_> {
 
     /// `console_line` with `inform` as `CommandSource.shouldInformAdmins`.
     fn console_line_telling(&mut self, state: &mut ServerState, line: &str, inform: bool) {
-        // The command may reach any player or chunk: regions out on their threads come home first.
-        self.land_residents();
+        // The command may reach any player or chunk: regions out on their threads come home first. A line that
+        // only reports the server's tick times reads nothing a region holds, so a monitor asking every few
+        // seconds does not bring them all home.
+        if !is_tick_report(line) {
+            self.land_residents();
+        }
         self.console_broadcast = Some(inform);
         self.console_command(state, line);
         self.console_broadcast = None;
@@ -2754,8 +2758,27 @@ impl Game<'_> {
     }
 }
 
+/// Whether console `line` only reports tick times (`tick query`, `/tps`, `/mspt`): it needs no region home.
+fn is_tick_report(line: &str) -> bool {
+    matches!(
+        line.trim().trim_start_matches('/'),
+        "tick query" | "tps" | "mspt"
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    /// Only lines that report tick times leave the regions out: anything else may reach a player or a chunk.
+    #[test]
+    fn only_a_tick_report_leaves_regions_out() {
+        for line in ["tick query", "/tick query", " tps ", "mspt"] {
+            assert!(super::is_tick_report(line), "{line}");
+        }
+        for line in ["tick rate 20", "tick freeze", "list", "tps 5", "say tick query", ""] {
+            assert!(!super::is_tick_report(line), "{line}");
+        }
+    }
+
     #[test]
     #[ignore = "daily"]
     fn broadcast_console_destination_follows_role_not_launch_marker() {

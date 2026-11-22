@@ -901,7 +901,7 @@ is on: that setting alone never splits the world into regions.
 [regions]
 enabled = true
 deadline_ms = 50             # how long a tick waits for its regions; a slower one keeps going and comes home later
-resident_ticks = 20          # ticks a region stays on its thread before it comes home to be split anew
+resident_ticks = 0           # 0: a region stays on its thread until something needs the server's; or the ticks before it comes home
 ```
 
 `/tps` (TPS and tick times, and each region's last tick) and `/mspt` are Horizon's own commands. A dedicated server
@@ -923,7 +923,7 @@ Region ticking trades some of vanilla's behaviour for speed, the way other regio
   for a player make the regions involved (often all of them) come back to the server's thread before they run. They
   work as without regions; a busy chat or a datapack that runs every tick costs most of the gain.
 - **Command blocks** reach only the chunks and players of the region they are in.
-- **Scores** a region's players change reach the clients when the region comes home (within `resident_ticks`).
+- **Scores** a region's players change make the region come home within a second, and reach the clients then.
 - **Raids and the dragon fight** run on the server's thread: a level with a raid near a player, and the End until its
   dragon is killed, are not split. A raid a player starts in a region brings that region home.
 - **The level-wide spawners** (wandering trader, pillager patrols, cats, phantoms, zombie sieges) count down in each
@@ -936,8 +936,8 @@ Region ticking trades some of vanilla's behaviour for speed, the way other regio
   delivered yet.
 - **Light** at the border of a region is worked out again when the region comes home.
 - **New terrain** around a player in a region is generated and lit on the server's thread and reaches the player
-  once the region has come home for it (one or two `resident_ticks` periods), so a player who teleports to new
-  ground waits a little longer for it.
+  without the region coming home, once the chunk and its neighbours are lit, so a player who teleports to new
+  ground (which brings their region home) waits a little longer for it.
 
 A region that panics comes home and the level ticks whole for 200 ticks before it is split again; the log says
 `a region of <level> failed`. A save that writes none of the entities in memory logs `regions: save lost entities`:

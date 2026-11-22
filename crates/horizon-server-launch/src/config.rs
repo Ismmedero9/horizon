@@ -138,7 +138,7 @@ enabled = true               # false pauses it and keeps the webhook
 # [regions]
 # enabled = true
 # deadline_ms = 50           # how long a tick waits for its regions
-# resident_ticks = 20        # ticks a region stays on its thread before it comes home
+# resident_ticks = 0         # 0: a region comes home only when it must; or the ticks a region stays on its thread
 "##;
 
 /// Each typed setting: its section, its name, and the vanilla key it writes.
@@ -249,7 +249,7 @@ pub struct Config {
 /// `[regions]`: `enabled = true` ticks the world by resident regions on threads of their own (the game's
 /// `game/runtime/regions.rs`): players in separate areas of a level are ticked in parallel. Off by default; with it off the
 /// tick is vanilla's serial one. `deadline_ms` is how long a tick waits for its regions, `resident_ticks` how many
-/// ticks a region stays on its own thread before it comes home. `[engine] parallel_tick` alone never turns it on. The
+/// ticks a region stays on its own thread before it comes home (0: only when something needs the server thread). `[engine] parallel_tick` alone never turns it on. The
 /// environment variables `HORIZON_REGIONS=0`, `HORIZON_PARALLEL_TICK=0` and `HORIZON_REGION_THREADS=0` still override it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -264,7 +264,7 @@ impl Default for Regions {
         Self {
             enabled: false,
             deadline_ms: 50,
-            resident_ticks: 20,
+            resident_ticks: 0,
         }
     }
 }
@@ -273,9 +273,6 @@ impl Regions {
         *self == Self::default()
     }
     fn check(&self) -> Result<(), String> {
-        if self.resident_ticks == 0 {
-            return Err("regions.resident_ticks must be at least 1".into());
-        }
         Ok(())
     }
 }
