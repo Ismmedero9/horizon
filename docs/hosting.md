@@ -918,10 +918,14 @@ Region ticking trades some of vanilla's behaviour for speed, the way other regio
 - **Order.** Regions tick at the same time, so what happens in one region and what happens in another in the same
   tick has no order, and the random draws are not the ones a serial tick would make. Regions read the clock and the
   weather one tick late.
-- **Things that need the whole level bring regions home first.** Chat, commands (the console's too), datapack tick
+- **Things that need the whole level bring regions home first.** Commands (the console's too), datapack tick
   functions, a join or a leave, a death, a portal or a teleport to another level, a save, and a native mod's hook
   for a player make the regions involved (often all of them) come back to the server's thread before they run. They
-  work as without regions; a busy chat or a datapack that runs every tick costs most of the gain.
+  work as without regions; a datapack that runs every tick, or a busy command line, costs most of the gain.
+- **Chat stays in its region.** A line a player says is relayed by their region to its own players, and the
+  server's thread carries it to the others (the server's own players and the other regions, which send it at
+  their next tick). It brings no region home, unless a native mod has to see it first, or the chat filter refuses it
+  (or someone is muted): the server's thread then handles it.
 - **Command blocks** reach only the chunks and players of the region they are in.
 - **Scores** a region's players change reach the clients when the region comes home (within `resident_ticks`).
 - **Raids and the dragon fight** run on the server's thread: a level with a raid near a player, and the End until its

@@ -11,6 +11,14 @@ use horizon_protocol::{
     text::{literal, translatable},
 };
 
+/// A chat line a region's players said, for the players in other regions and on the server's thread: what
+/// `send_chat` needs, kept to be sent later ([`Hub::deliver_chat`]).
+#[derive(Clone, Debug)]
+pub struct RegionChat {
+    pub message: ChatMessage,
+    pub bound: play::ChatTypeBound,
+}
+
 /// Now, in epoch milliseconds (Instant.now()).
 pub fn now_millis() -> i64 {
     std::time::SystemTime::now()
@@ -258,6 +266,13 @@ impl Hub {
         let line = format!("<{name}> {}", message.content);
         // No mods here (`has_mods` above), so no `chat_recipient` listener hides anyone.
         self.broadcast_chat(&message, &bound, line, &[], events);
+        // With players away in resident regions (or as a region's hub) the line has players elsewhere to reach.
+        if self.region_shell || !self.away.is_empty() {
+            self.region_chat_out.push(RegionChat {
+                message: message.clone(),
+                bound: bound.clone(),
+            });
+        }
         events.push(HostEvent::PlayerChat {
             sender: uuid,
             text: message.content,
@@ -363,6 +378,15 @@ impl Hub {
         for k in 0..self.guests.len() {
             if self.guests[k].placed && !hidden.contains(&self.guests[k].uuid) {
                 self.send_chat(k, message, bound);
+            }
+        }
+    }
+
+    /// A line said elsewhere (in another region, or on the server's thread) to the players of this hub.
+    pub fn deliver_chat(&mut self, line: &RegionChat) {
+        for k in 0..self.guests.len() {
+            if self.guests[k].placed {
+                self.send_chat(k, &line.message, &line.bound);
             }
         }
     }

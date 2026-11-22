@@ -537,6 +537,7 @@ def run_once(kind, bots, behaviour, args, out):
              '--seed', str(args.seed), '--report', '-',
              *(['--explore-speed', str(args.explore_speed)] if args.explore_speed else []),
              *(['--height', '0', '--ground'] if args.ground else []),
+             *(['--chat-every', str(args.chat_every)] if args.chat_every else []),
              *(['--capture', str(args.capture)] if args.capture else [])],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         bot_lines = []
@@ -689,6 +690,8 @@ def main():
     parser.add_argument('--bots', default='1,10,25,50')
     parser.add_argument('--behaviour', default='walk,explore', help='one pass per behaviour (comma-separated)')
     parser.add_argument('--join-every', type=float, default=1.0)
+    parser.add_argument('--chat-every', type=int, default=0,
+                        help='every bot says a line in chat every N ticks (Horizon bots); 0, the default, never')
     parser.add_argument('--capture', type=Path, help='capture first bot play packets for protocol replay (overwritten each run)')
     parser.add_argument('--warmup', type=int, default=60)
     parser.add_argument('--seconds', type=int, default=300)

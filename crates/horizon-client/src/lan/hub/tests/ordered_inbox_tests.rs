@@ -121,6 +121,99 @@ fn an_away_players_packets_keep_their_order_around_one_for_the_server() {
     assert_eq!(held, ["server", "tick end"]);
 }
 
+fn say(text: &str) -> S {
+    S::Chat(horizon_protocol::packets::play::Chat {
+        message: text.to_owned(),
+        timestamp: 0,
+        salt: 0,
+        signature: None,
+        last_seen: horizon_protocol::packets::play::LastSeenUpdate {
+            offset: 0,
+            acknowledged: [0; 3],
+            checksum: 0,
+        },
+    })
+}
+
+/// A chat line of a player away in a region is handled by the region and is no reason to bring every region
+/// home; a command still is. The line is kept for the server's thread to carry to the other players.
+#[test]
+fn a_line_said_in_a_region_stays_there_and_is_kept_for_the_others() {
+    let (mut hub, _out) = hub_with_a_guest();
+    let conn = hub.guests[0].conn;
+    hub.away.insert(conn);
+    publish_packet(&hub, say("hello"));
+    with_input_context(|ctx| drop(hub.poll(ctx)));
+    assert!(!hub.away_chat_pending());
+    assert_eq!(hub.away_server_conns(), Some(Vec::new()));
+    let mut region = hub.region_shell();
+    region.guests.push(hub.guests.remove(0));
+    hub.give_away(&mut region);
+    assert!(hub.away_events.is_empty());
+    with_input_context(|ctx| drop(region.drain_packets(ctx)));
+    assert_eq!(region.region_chat_out.len(), 1);
+    assert_eq!(region.region_chat_out[0].message.content, "hello");
+    // Players elsewhere are sent it by `deliver_chat`, numbered for their own connection.
+    let (mut other, other_out) = hub_with_a_guest();
+    other.deliver_chat(&region.region_chat_out[0]);
+    assert_eq!(other.guests[0].chat_index, 1);
+    drop(other_out);
+
+    // The chat filter is the server's: a line it refuses is for the server's thread, one it passes is not.
+    struct Words;
+    impl horizon_server_files::chat_guard::ChatGuard for Words {
+        fn matches(&self, text: &str) -> bool {
+            text.contains("badword")
+        }
+        fn muted(&self, _: u128, _: i64) -> Option<&horizon_server_files::chat_guard::Mute> {
+            None
+        }
+        fn mutes(&self, _: i64) -> Vec<&horizon_server_files::chat_guard::Mute> {
+            Vec::new()
+        }
+        fn mute(&mut self, _: u128, _: &str, _: Option<i64>, _: &str, _: Option<String>) {}
+        fn strike(
+            &mut self,
+            _: u128,
+            _: &str,
+            _: i64,
+        ) -> (u32, horizon_server_files::chat_guard::Action) {
+            (1, horizon_server_files::chat_guard::Action::Refused)
+        }
+        fn unmute(&mut self, _: &str) -> Option<String> {
+            None
+        }
+        fn log(
+            &mut self,
+            _: i64,
+            _: &str,
+            _: u128,
+            _: horizon_server_files::chat_guard::Place,
+            _: u32,
+            _: horizon_server_files::chat_guard::Action,
+            _: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    let (mut hub, _out) = hub_with_a_guest();
+    hub.set_chat_filter(Some(Box::new(Words)));
+    assert!(hub.away_local(&say("hello")));
+    assert!(!hub.away_local(&say("a badword here")));
+
+    // A command reaches every player: every region must come home for it.
+    let (mut hub, _out) = hub_with_a_guest();
+    hub.away.insert(hub.guests[0].conn);
+    publish_packet(
+        &hub,
+        S::ChatCommand(horizon_protocol::packets::play::ChatCommand {
+            command: "list".to_owned(),
+        }),
+    );
+    with_input_context(|ctx| drop(hub.poll(ctx)));
+    assert!(hub.away_chat_pending());
+}
+
 /// The timer's balance is given a player's own time since it was last ticked, by whichever hub ticks it: a player
 /// lent to a resident region is given its time there by the region's hub, whose clock had not run for it.
 #[test]
