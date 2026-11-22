@@ -445,16 +445,29 @@ impl CreakingState {
         &mut self,
         regions: usize,
         region_of: impl Fn((i32, i32)) -> Option<usize>,
+        scope: Option<&[(i32, i32)]>,
     ) -> Vec<horizon_client::fast_hash::FxHashSet<(i32, i32)>> {
         let mut out: Vec<horizon_client::fast_hash::FxHashSet<(i32, i32)>> =
             (0..regions).map(|_| Default::default()).collect();
-        self.scanned.retain(|&k| match region_of(k) {
-            Some(r) if r < regions => {
-                out[r].insert(k);
-                false
+        match scope {
+            // Only the chunks of `scope` can go: each is looked up, the set is not walked.
+            Some(keys) => {
+                for &k in keys {
+                    if let Some(r) = region_of(k).filter(|&r| r < regions)
+                        && self.scanned.remove(&k)
+                    {
+                        out[r].insert(k);
+                    }
+                }
             }
-            _ => true,
-        });
+            None => self.scanned.retain(|&k| match region_of(k) {
+                Some(r) if r < regions => {
+                    out[r].insert(k);
+                    false
+                }
+                _ => true,
+            }),
+        }
         out
     }
     /// A region's scanned chunks, for its game's tick.

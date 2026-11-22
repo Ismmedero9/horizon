@@ -90,12 +90,27 @@ impl RandomTickSections {
         &mut self,
         regions: usize,
         region_of: impl Fn((i32, i32)) -> Option<usize>,
+        scope: Option<&[(i32, i32)]>,
     ) -> Vec<Self> {
         let mut out: Vec<Self> = (0..regions).map(|_| Self::default()).collect();
-        for (key, cached) in self.chunks.extract_if(|key, _| region_of(*key).is_some()) {
-            out[region_of(key).expect("extracted for its region")]
-                .chunks
-                .insert(key, cached);
+        match scope {
+            // Only the chunks of `scope` can go: each is looked up, the cache is not walked.
+            Some(keys) => {
+                for &key in keys {
+                    if let Some(r) = region_of(key)
+                        && let Some(cached) = self.chunks.remove(&key)
+                    {
+                        out[r].chunks.insert(key, cached);
+                    }
+                }
+            }
+            None => {
+                for (key, cached) in self.chunks.extract_if(|key, _| region_of(*key).is_some()) {
+                    out[region_of(key).expect("extracted for its region")]
+                        .chunks
+                        .insert(key, cached);
+                }
+            }
         }
         out
     }
