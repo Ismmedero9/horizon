@@ -534,6 +534,11 @@ pub struct Hub {
     /// only there: a level's players away in a region say nothing of another level's streaming).
     pub away_places: std::collections::HashMap<String, Vec<(i32, i32)>>,
     away_events: Vec<(NetEvent, crate::net::ingress::ReceiveLease<NetEvent>)>,
+    /// This is a region's hub (`region_shell`): the chat lines its players said are kept in `region_chat_out`.
+    pub region_shell: bool,
+    /// Chat lines said by players of this hub that players away in resident regions have to be sent too: the
+    /// server's thread carries them there ([`RegionChat`]). Only filled while regions are resident.
+    pub region_chat_out: Vec<chat::RegionChat>,
     /// The sleep counts (players not in spectator mode, in bed, asleep 100 ticks) the resident regions reported
     /// last, summed: the server's night skip counts them with its own players. In a region's hub: its own report.
     pub away_sleep: (i64, i64, i64),
@@ -868,6 +873,7 @@ impl Hub {
             self.loop_context.clone(),
         );
         hub.copy_region_settings(self);
+        hub.region_shell = true;
         hub
     }
 
@@ -1020,6 +1026,8 @@ impl Hub {
             away_sleep: (0, 0, 0),
             wake_request: false,
             away_events: Vec::new(),
+            region_shell: false,
+            region_chat_out: Vec::new(),
             replay: Vec::new(),
             entities: Default::default(),
             joined: Default::default(),
@@ -3189,14 +3197,42 @@ impl Hub {
     pub fn away_wants_server(&self) -> bool {
         self.away_events
             .iter()
-            .any(|(event, _)| !matches!(event, NetEvent::Packet(_, p, _) if region_local(p)))
+            .any(|(event, _)| !matches!(event, NetEvent::Packet(_, p, _) if self.away_local(p)))
     }
 
-    /// Whether an away player sent a chat message or a command: it reaches every player, so every region must be
-    /// home for it (the recipients' chat chains live with their players).
+    /// Whether a packet of an away player is handled by its region: [`region_local`], and plain chat (a line and
+    /// its acknowledgements) while no mod or chat filter has to see it first. The region's hub relays the line to
+    /// its own players, and the server's thread carries it to the others ([`chat::RegionChat`]).
+    pub fn away_local(&self, p: &S) -> bool {
+        region_local(p)
+            || match p {
+                S::ChatAck(_) => self.chat_in_region(),
+                S::Chat(c) => self.chat_in_region() && self.chat_filter_passes(&c.message),
+                _ => false,
+            }
+    }
+
+    /// Whether chat is handled by the region it is said in: no native mod has to see a line on the server's
+    /// thread before it goes out.
+    fn chat_in_region(&self) -> bool {
+        !self.mods_loaded && !crate::native_client_hooks::has_mods()
+    }
+
+    /// Whether the chat filter (which only the server's hub has) would let `text` through for any player: it
+    /// holds none of its words and nobody is muted. A text it would refuse is for the server's thread, which
+    /// counts the hit and tells the sender.
+    fn chat_filter_passes(&self, text: &str) -> bool {
+        self.chat_filter
+            .as_deref()
+            .is_none_or(|guard| !guard.matches(text) && guard.mutes(chat::now_millis()).is_empty())
+    }
+
+    /// Whether an away player sent a command, or a chat message that its region cannot relay ([`Hub::away_local`]):
+    /// it reaches every player, so every region must be home for it (the recipients' chat chains live with their
+    /// players).
     pub fn away_chat_pending(&self) -> bool {
         self.away_events.iter().any(|(e, _)| {
-            matches!(e, NetEvent::Packet(_, p, _) if matches!(&**p, S::Chat(_) | S::ChatCommand(_) | S::ChatCommandSigned(_)))
+            matches!(e, NetEvent::Packet(_, p, _) if matches!(&**p, S::Chat(_) | S::ChatCommand(_) | S::ChatCommandSigned(_)) && !self.away_local(p))
         })
     }
 
@@ -3206,14 +3242,16 @@ impl Hub {
             return;
         }
         let mine: crate::fast_hash::FxHashSet<u32> = region.guests.iter().map(|g| g.conn).collect();
+        let events = std::mem::take(&mut self.away_events);
+        let local = |p: &S| self.away_local(p);
         // Only what stays in the region goes: a packet that reaches past it (a chat message) stays for the server's
         // thread, with every later packet of its connection, so the order of one player's packets keeps.
         let mut blocked: crate::fast_hash::FxHashSet<u32> = Default::default();
         let (mut given, mut kept) = (Vec::new(), Vec::new());
-        for e in std::mem::take(&mut self.away_events) {
+        for e in events {
             match &e.0 {
                 NetEvent::Packet(conn, p, _)
-                    if mine.contains(conn) && !blocked.contains(conn) && region_local(p) =>
+                    if mine.contains(conn) && !blocked.contains(conn) && local(p) =>
                 {
                     given.push(e)
                 }
@@ -3255,7 +3293,7 @@ impl Hub {
         let mut out = Vec::new();
         for (event, _) in &self.away_events {
             match event {
-                NetEvent::Packet(_, p, _) if region_local(p) => {}
+                NetEvent::Packet(_, p, _) if self.away_local(p) => {}
                 NetEvent::Packet(conn, ..) | NetEvent::Left(conn, _) => {
                     if !out.contains(conn) {
                         out.push(*conn);

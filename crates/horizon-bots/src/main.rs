@@ -75,6 +75,8 @@ horizon-bots: load-test bots for a Minecraft Java Edition 26.3 server (offline m
   --ack-mode MODE        chunk batch feedback: vanilla (default) or 64 (fixed chunks per tick);
                          one ACK per completed batch; use explore for a controlled pacing test
   --flood N              packets a tick for the flood behaviours; default 100
+  --chat-every N         each bot says a line in chat every N ticks (its own phase), whatever it does;
+                         default 0, never
   --attack NAME          attack the player NAME twice a second, from wherever the bot is (a reach test),
                          swinging after each attack as vanilla's client does. NAME,NAME...: each of them
                          in the same tick (a multi-target kill aura, for the anticheat's tests);
@@ -190,6 +192,8 @@ struct Options {
     /// --crits: fight bots alternate jumped critical hits and sweeps at a sword's cooldown.
     crits: bool,
     flood: usize,
+    /// --chat-every: ticks between a bot's chat lines; 0 never.
+    chat_every: u64,
     /// None uses vanilla estimation; --ack-mode 64 requests a fixed rate.
     ack_rate: Option<f32>,
     no_read: bool,
@@ -235,6 +239,7 @@ fn options() -> Result<Options, String> {
         no_swing: false,
         crits: false,
         flood: 100,
+        chat_every: 0,
         ack_rate: None,
         no_read: false,
         no_loaded: false,
@@ -310,6 +315,7 @@ fn options() -> Result<Options, String> {
                 };
             }
             "--flood" => o.flood = value.parse().map_err(|_| number("packets a tick"))?,
+            "--chat-every" => o.chat_every = value.parse().map_err(|_| number("ticks"))?,
             "--attack" => o.attack = Some(value),
             "--attack-after" => o.attack_after = value.parse().map_err(|_| number("seconds"))?,
             "--attack-rounds" => o.attack_rounds = value.parse().map_err(|_| number("a number"))?,
@@ -1494,6 +1500,25 @@ fn run_bot(
             if let Some(body) = costly(behaviour, i, sequence, pos, &mut random) {
                 send(body);
             }
+        }
+        if o.chat_every > 0 && tick % o.chat_every == index as u64 % o.chat_every {
+            // An unsigned line: the server needs no profile key for it, and a last-seen update of nothing.
+            send(
+                play::Serverbound::Chat(play::Chat {
+                    message: format!("bot {index} says {tick}"),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis() as i64),
+                    salt: 0,
+                    signature: None,
+                    last_seen: play::LastSeenUpdate {
+                        offset: 0,
+                        acknowledged: [0; 3],
+                        checksum: 0,
+                    },
+                })
+                .encode(),
+            );
         }
         if joined.elapsed().as_secs_f64() >= o.attack_after
             && tick % 10 == 0

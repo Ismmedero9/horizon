@@ -318,6 +318,8 @@ pub(super) struct RegionState {
     /// What native mods sent to players who are away in a region (a clientbound packet, whether it is for a
     /// Horizon client only): delivered to the region's player before its next tick.
     pub(super) away_out: Vec<(u128, horizon_protocol::packets::play::Clientbound, bool)>,
+    /// Counts the resident regions' slots made, for their `uid`s.
+    slot_uids: u64,
     /// Where the server thread's tick time goes while regions are resident.
     pub(super) prof: super::region_profile::TickProfile,
 }
@@ -372,6 +374,10 @@ struct Slot {
     players: Vec<AwayPlayer>,
     /// Its players' sleep counts as it last reported them.
     sleep: (i64, i64, i64),
+    /// Names it among the regions ([`Game::route_region_chat`]).
+    uid: u64,
+    /// Chat lines said elsewhere for its players, sent when it is next lent or lands.
+    mail: Vec<horizon_client::lan::hub::chat::RegionChat>,
 }
 
 pub(super) struct AwayPlayer {
@@ -381,8 +387,10 @@ pub(super) struct AwayPlayer {
 }
 
 impl Slot {
-    fn new(game: Box<Game<'static>>) -> Self {
+    fn new(game: Box<Game<'static>>, uid: u64) -> Self {
         Self {
+            uid,
+            mail: Vec::new(),
             game: Some(game),
             running: None,
             places: Vec::new(),
@@ -1022,7 +1030,8 @@ impl Game<'_> {
             }
             w.lan = Some(shell);
             w.bind_lan_residents();
-            let mut slot = Slot::new(w);
+            self.regions.slot_uids += 1;
+            let mut slot = Slot::new(w, self.regions.slot_uids);
             slot.conns = conns;
             slot.fresh = true;
             // Each region comes home at its own tick of the period.
@@ -1065,6 +1074,7 @@ impl Game<'_> {
             if relent {
                 self.regions.prof.add(Step::Split, relending);
             }
+            self.route_region_chat(Some(&mut set));
             match self.residents_must_land(&set) {
                 Some(Land::All(why)) => {
                     self.regions.prof.landed_because(why);
@@ -1153,6 +1163,9 @@ impl Game<'_> {
             if let (Some(shell), Some(host)) = (w.lan.as_mut(), self.lan.as_mut()) {
                 shell.hub.copy_region_settings(&host.hub);
                 host.hub.give_away(&mut shell.hub);
+                for line in slot.mail.drain(..) {
+                    shell.hub.deliver_chat(&line);
+                }
                 shell.hub.wake_request |= host.hub.wake_request;
                 self.regions.away_out.retain(|(uuid, packet, horizon)| {
                     let Some(g) = shell
@@ -1290,6 +1303,7 @@ impl Game<'_> {
             }
         });
         self.regions.prof.add(Step::Wait, waiting);
+        self.route_region_chat(Some(&mut set));
         super::health::record_regions(
             self.dim.id(),
             set.games
@@ -1456,6 +1470,11 @@ impl Game<'_> {
             return;
         };
         let mut host = self.lan.take();
+        if let Some(shell) = w.lan.as_mut() {
+            for line in slot.mail.drain(..) {
+                shell.hub.deliver_chat(&line);
+            }
+        }
         let drawn = self.take_region_back(&mut w, &set.chunks[k]);
         self.rand_sequences.absorb(drawn);
         if let (Some(host), Some(shell)) = (host.as_mut(), w.lan.as_mut()) {
@@ -1556,8 +1575,9 @@ impl Game<'_> {
     }
 
     /// The resident regions of the level in place back: their parts of the level and their players.
-    fn land_resident_set(&mut self, set: ResidentSet) {
+    fn land_resident_set(&mut self, mut set: ResidentSet) {
         let dim = self.dim;
+        self.route_region_chat(Some(&mut set));
         self.streaming.lent = None;
         let mut host = self.lan.take();
         let mut back = Vec::with_capacity(set.games.len());
@@ -1577,6 +1597,11 @@ impl Game<'_> {
                 // Home already, alone.
                 back.push(w);
                 continue;
+            }
+            if let Some(shell) = w.lan.as_mut() {
+                for line in slot.mail.drain(..) {
+                    shell.hub.deliver_chat(&line);
+                }
             }
             let drawn = self.take_region_back(&mut w, &chunks);
             self.rand_sequences.absorb(drawn);
@@ -1676,6 +1701,44 @@ impl Game<'_> {
             self.regions.away_out.push((uuid, packet, horizon_only));
         }
         away
+    }
+
+    /// Carries the chat lines players said to the players who were not there: a line a region's hub relayed to its
+    /// own players goes to the server's own players and into the mail of every other resident region (sent when
+    /// the region is next lent); a line the server's hub relayed while regions were out goes into every region's
+    /// mail. `mine` is the resident set being ticked, which is not among `self.regions.resident`.
+    fn route_region_chat(&mut self, mine: Option<&mut ResidentSet>) {
+        // (the region it was said in, 0 for the server's hub; the line)
+        let mut lines: Vec<(u64, horizon_client::lan::hub::chat::RegionChat)> = Vec::new();
+        if let Some(host) = self.lan.as_mut() {
+            lines.extend(host.hub.region_chat_out.drain(..).map(|l| (0, l)));
+        }
+        let mut sets: Vec<&mut ResidentSet> = Vec::new();
+        sets.extend(mine);
+        sets.extend(self.regions.resident.values_mut());
+        sets.extend(self.regions.flight.as_mut().map(|(_, f)| &mut f.set));
+        for set in &mut sets {
+            for slot in set.games.iter_mut().filter(|s| !s.landed) {
+                if let Some(shell) = slot.game.as_mut().and_then(|w| w.lan.as_mut()) {
+                    lines.extend(shell.hub.region_chat_out.drain(..).map(|l| (slot.uid, l)));
+                }
+            }
+        }
+        for (origin, line) in lines {
+            if origin != 0
+                && let Some(host) = self.lan.as_mut()
+            {
+                host.hub.deliver_chat(&line);
+            }
+            // A region that came home alone has its players in the server's hub, which has them already.
+            for slot in sets
+                .iter_mut()
+                .flat_map(|set| set.games.iter_mut())
+                .filter(|s| !s.landed && s.uid != origin)
+            {
+                slot.mail.push(line.clone());
+            }
+        }
     }
 
     /// What was queued for players who are home now goes out.
