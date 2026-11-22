@@ -139,7 +139,7 @@ def cases():
 
 
 def game_placement(work):
-    test = ('game::blocks::block_items::decorated_pot_placement_tests::'
+    test = ('game::decorated_pot_placement_tests::'
             'ordinary_pot_placement_survives_pick_reload_and_default_replacement')
     resources = Path(os.environ.get('HORIZON_TEST_RESOURCES', lib.lab.RESOURCES)).resolve()
     if not (resources / 'block-behaviours.json').is_file():

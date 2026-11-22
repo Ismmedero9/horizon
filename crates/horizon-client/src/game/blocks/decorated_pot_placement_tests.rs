@@ -1,9 +1,9 @@
 //! #16482: a normal block-item use must keep a raw decorated-pot entity.
-//! Loaded as a child test module of `block_items`; no production fixture hooks.
+//! No production fixture hooks.
 use super::*;
 use crate::game::native_machines::tests::server_game;
-use horizon_client::mod_api::NativeUseTarget;
-use horizon_core::{geometry::Direction, position::BlockPos};
+use horizon_client::{item_data, items::ItemStack, save};
+use horizon_core::{nbt::Tag, position::BlockPos};
 use std::sync::Arc;
 
 const POS: [i32; 3] = [4, 200, 4];
@@ -12,7 +12,7 @@ const CONTENTS: &str =
     r#"{id:"minecraft:diamond",count:3,components:{"minecraft:custom_name":"Inside"}}"#;
 
 fn parse(input: &str) -> Tag {
-    let (tag, used) = horizon_world::nbt::parse_snbt(input).expect("valid test NBT");
+    let (tag, used) = horizon_core::nbt::parse_snbt(input).expect("valid test NBT");
     assert_eq!(used, input.len());
     tag
 }
@@ -20,29 +20,36 @@ fn parse(input: &str) -> Tag {
 /// Unlike calling apply_placed_item directly, this traverses use_item/use_hand,
 /// including the placement caller's decision whether the new entity is modeled.
 fn place(game: &mut Game<'_>, stack: ItemStack) {
-    let used = game
-        .native_use_as_player(
-            stack,
-            [4.5, 201.5, 6.5],
-            180.0,
-            45.0,
-            NativeUseTarget::Block {
-                pos: [4, 199, 4],
-                face: Direction::Up,
-                point: [4.5, 200.0, 4.5],
-            },
-            false,
-        )
-        .expect("an authoritative server with no player acting");
-    assert!(used.consumed, "the ordinary block-item use succeeded");
+    game.set_mode_id(0);
+    game.inventory[game.selected] = Some(stack);
+    let hit = Hit {
+        pos: [4, 199, 4],
+        face: [0, 1, 0],
+        point: [4.5, 200.0, 4.5],
+        inside: false,
+    };
+    game.forced_hit = Some(hit);
+    game.guest_use = Some(GuestUse::OnBlock(Hand::Main));
+    game.use_item_as_player()
+        .expect("the ordinary block-item use succeeds");
+    game.forced_hit = None;
+    game.guest_use = None;
     assert!(
-        used.held.is_none(),
+        game.inventory[game.selected].is_none(),
         "survival placement consumed the one pot"
     );
     assert_eq!(
         &*game.res.facts().get(game.world.block(4, 200, 4)).name,
         "minecraft:decorated_pot"
     );
+}
+
+/// The component patch of `stack`, from the item codec.
+fn components(stack: &ItemStack) -> horizon_core::nbt::Compound {
+    match item_data::encode_components(stack) {
+        Some(Tag::Compound(c)) => c,
+        _ => Default::default(),
+    }
 }
 
 fn views(game: &Game<'_>, decorated: bool) {
@@ -142,7 +149,7 @@ fn reload(game: &mut Game<'_>, decorated: bool) {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and scratch homes/cwd"]
+#[ignore = "daily"]
 fn ordinary_pot_placement_survives_pick_reload_and_default_replacement() {
     let mut game = server_game();
     game.build_registries();

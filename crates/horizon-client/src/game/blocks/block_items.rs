@@ -379,10 +379,6 @@ impl Game<'_> {
 }
 
 #[cfg(test)]
-#[path = "decorated_pot_placement_tests.rs"]
-mod decorated_pot_placement_tests;
-
-#[cfg(test)]
 mod tests {
     use super::{clone_item, picked_item};
 
