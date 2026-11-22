@@ -375,7 +375,7 @@ impl Game<'_> {
             } else {
                 ("title", "show.title")
             };
-            self.show_title(ctx, &players, kind)?;
+            self.send_resolved_title(ctx, &players, kind)?;
             key
         };
         let message = if single {
@@ -391,7 +391,7 @@ impl Game<'_> {
     }
     /// TitleCommand.showTitle: the component is resolved for each target
     /// (`ResolutionContext.withEntityOverride`) and sent to that target.
-    fn show_title(&mut self, ctx: &Context, players: &[Target], kind: &str) -> R<()> {
+    fn send_resolved_title(&mut self, ctx: &Context, players: &[Target], kind: &str) -> R<()> {
         for &t in players {
             let text = self.component_arg_for(ctx, "title", Some(t))?;
             let sent = play::Text {
