@@ -537,6 +537,7 @@ impl BlockEntities {
         &mut self,
         regions: usize,
         region_of: impl Fn(Pos) -> Option<usize>,
+        scope: Option<&[(i32, i32)]>,
     ) -> Vec<BlockEntities> {
         let mut out: Vec<BlockEntities> = (0..regions)
             .map(|_| {
@@ -566,9 +567,26 @@ impl BlockEntities {
         }
         // Each region's map at its size from the start: a block entity is about a kilobyte, and a map that grew
         // as they came moved every one of them again each time.
+        // The block entities that go: with a `scope` (the chunks a restricted split can reach) found by chunk, not
+        // by walking the whole map.
+        let moving: Vec<Pos> = match scope {
+            Some(chunks) => chunks
+                .iter()
+                .filter_map(|chunk| self.by_chunk.get(chunk))
+                .flatten()
+                .copied()
+                .filter(|pos| region_of(*pos).is_some_and(|r| r < regions))
+                .collect(),
+            None => self
+                .map
+                .keys()
+                .copied()
+                .filter(|pos| region_of(*pos).is_some_and(|r| r < regions))
+                .collect(),
+        };
         let mut sizes = vec![0usize; regions];
-        for pos in self.map.keys() {
-            if let Some(r) = region_of(*pos).filter(|&r| r < regions) {
+        for pos in &moving {
+            if let Some(r) = region_of(*pos) {
                 sizes[r] += 1;
             }
         }
@@ -583,7 +601,10 @@ impl BlockEntities {
                 None => self.added.push((pos, token)),
             }
         }
-        for (pos, entity) in self.map.extract_if(|pos, _| region_of(*pos).is_some()) {
+        for pos in moving {
+            let Some(entity) = self.map.remove(&pos) else {
+                continue;
+            };
             let r = region_of(pos).expect("extracted for its region");
             out[r].borrowed.push(pos);
             self.lent.insert(pos);
@@ -1494,7 +1515,7 @@ mod tests {
         }
         assert_eq!(order(&mut b, &states).len(), 2);
         // Two regions: chunk 0 and chunk 1.
-        let mut parts = b.lend(2, |p| Some((p.0 >> 4) as usize));
+        let mut parts = b.lend(2, |p| Some((p.0 >> 4) as usize), None);
         assert!(b.is_empty());
         assert_eq!(parts[0].len(), 1);
         assert_eq!(order(&mut parts[1], &states), vec![(17, 64, 1)]);
@@ -1511,6 +1532,25 @@ mod tests {
         assert_eq!(b.len(), 2);
     }
 
+    /// A lend scoped to some chunks finds their block entities by chunk and lends what the whole walk would.
+    #[test]
+    fn a_scoped_lend_takes_the_block_entities_of_its_chunks() {
+        let (mine, also, other) = ((1, 64, 1), (2, 70, 3), (17, 64, 1));
+        let mut b = level();
+        for pos in [mine, also, other] {
+            b.insert(pos, hopper());
+        }
+        let region = |p: Pos| (p.0 >> 4 == 0).then_some(0);
+        // The scope names chunk 0 and a chunk that holds nothing.
+        let mut parts = b.lend(1, region, Some(&[(0, 0), (9, 9)]));
+        assert_eq!(parts[0].len(), 2);
+        assert!(parts[0].get(&mine).is_some() && parts[0].get(&also).is_some());
+        assert_eq!(b.len(), 1);
+        assert!(b.get(&other).is_some());
+        b.take_back(parts.remove(0));
+        assert_eq!(b.len(), 3);
+    }
+
     /// A sweep of the level's ticking list, set off by another removal while a region holds block entities, keeps
     /// the lent ones' slots.
     #[test]
@@ -1522,7 +1562,7 @@ mod tests {
         b.insert(other, hopper());
         assert_eq!(order(&mut b, &states).len(), 2);
         // Only chunk 0 is lent; another block entity is removed and the list swept.
-        let mut parts = b.lend(1, |p| (p.0 >> 4 == 0).then_some(0));
+        let mut parts = b.lend(1, |p| (p.0 >> 4 == 0).then_some(0), None);
         b.remove(&other);
         let swept = b.tickers(|p| states.get(&p).copied().unwrap_or(0));
         assert_eq!(swept.iter().map(|(p, _)| *p).collect::<Vec<_>>(), [lent]);

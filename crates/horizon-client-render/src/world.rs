@@ -392,19 +392,33 @@ impl World {
         regions: usize,
         region_of: impl Fn((i32, i32)) -> Option<usize>,
         seeds: &[i64],
+        scope: Option<&[(i32, i32)]>,
     ) -> Vec<World> {
-        let chunks = self.chunks.lend(regions, &region_of);
+        let chunks = self.chunks.lend(regions, &region_of, scope);
         let mut entities = self
             .block_entities
-            .lend(regions, |p| region_of((p.0 >> 4, p.2 >> 4)));
+            .lend(regions, |p| region_of((p.0 >> 4, p.2 >> 4)), scope);
         let mut inhabited: Vec<FxHashMap<(i32, i32), i64>> =
             (0..regions).map(|_| FxHashMap::default()).collect();
-        for (key, t) in self
-            .inhabited
-            .extract_if(|key, _| region_of(*key).is_some())
-        {
-            if let Some(r) = region_of(key) {
-                inhabited[r].insert(key, t);
+        match scope {
+            Some(keys) => {
+                for &key in keys {
+                    if let Some(r) = region_of(key)
+                        && let Some(t) = self.inhabited.remove(&key)
+                    {
+                        inhabited[r].insert(key, t);
+                    }
+                }
+            }
+            None => {
+                for (key, t) in self
+                    .inhabited
+                    .extract_if(|key, _| region_of(*key).is_some())
+                {
+                    if let Some(r) = region_of(key) {
+                        inhabited[r].insert(key, t);
+                    }
+                }
             }
         }
         let mut out: Vec<World> = chunks
@@ -1311,7 +1325,7 @@ mod region_tests {
         world.game_time = 77;
         world.chest_openers.insert((1, 64, 1), (2, 3.0));
         world.chest_openers.insert((33, 64, 1), (1, 4.0));
-        let mut parts = world.lend(2, |(x, _)| Some((x / 2) as usize), &[5, 6]);
+        let mut parts = world.lend(2, |(x, _)| Some((x / 2) as usize), &[5, 6], None);
         assert_eq!(world.chunks.len(), 0);
         assert_eq!(parts[0].chunks.len(), 2);
         assert_eq!(parts[1].game_time, 77);
@@ -1346,7 +1360,7 @@ mod region_tests {
             .insert((2, 64, 2), horizon_core::nbt::Tag::String("old".into()));
         // Another chunk, not lent: stays.
         world.chest_openers.insert((81, 64, 1), (1, 4.0));
-        let mut parts = world.lend(1, |(x, _)| (x == 0).then_some(0), &[5]);
+        let mut parts = world.lend(1, |(x, _)| (x == 0).then_some(0), &[5], None);
         parts[0].chest_openers.clear();
         parts[0].block_names.clear();
         world.take_back(parts.remove(0));

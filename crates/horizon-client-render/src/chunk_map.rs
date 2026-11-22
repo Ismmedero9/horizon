@@ -604,6 +604,7 @@ impl ChunkMap {
         &mut self,
         regions: usize,
         region_of: impl Fn(Key) -> Option<usize>,
+        scope: Option<&[Key]>,
     ) -> Vec<ChunkMap> {
         let mut out: Vec<ChunkMap> = (0..regions)
             .map(|_| {
@@ -613,19 +614,37 @@ impl ChunkMap {
             })
             .collect();
         let mut gone = Vec::new();
-        for (key, chunk) in self.columns.extract_if(|key, _| region_of(*key).is_some()) {
+        let (fresh, near) = (&mut self.fresh, &self.near);
+        let mut take = |key: Key, chunk: Arc<Chunk>| {
             let r = region_of(key).expect("extracted for its region");
             gone.push(key);
-            if self.fresh.remove(&key) {
+            if fresh.remove(&key) {
                 out[r].fresh.insert(key);
             }
             // The count of resident neighbours as the whole map has it: a region owns a ring of chunks around the
             // ones it ticks, so only the edge of what it owns counts neighbours it was not lent.
-            if let Some(&n) = self.near.get(&key) {
+            if let Some(&n) = near.get(&key) {
                 out[r].near.insert(key, n);
             }
             out[r].columns.insert(key, chunk);
             out[r].cache_slot(key);
+        };
+        match scope {
+            // Only the chunks of `scope` can go: each is looked up, the map is not walked.
+            Some(keys) => {
+                for &key in keys {
+                    if region_of(key).is_some()
+                        && let Some(chunk) = self.columns.remove(&key)
+                    {
+                        take(key, chunk);
+                    }
+                }
+            }
+            None => {
+                for (key, chunk) in self.columns.extract_if(|key, _| region_of(*key).is_some()) {
+                    take(key, chunk);
+                }
+            }
         }
         // The grid kept a handle on each: a lent column must read as absent here, and a handle left behind would
         // also make the region's first write copy the whole column.
@@ -945,7 +964,7 @@ mod tests {
             map.insert((x, 0), Arc::new(Chunk::empty(0, 0)));
         }
         let revision = map.membership_revision();
-        let parts = map.lend(2, |(x, _)| Some((x / 2) as usize));
+        let parts = map.lend(2, |(x, _)| Some((x / 2) as usize), None);
         assert_eq!(map.len(), 0);
         assert_eq!(parts[0].len(), 2);
         assert_eq!(parts[1].len(), 2);
@@ -959,12 +978,41 @@ mod tests {
     }
 
     #[test]
+    fn a_lend_scoped_to_a_region_takes_what_the_whole_walk_takes() {
+        let build = || {
+            let mut map = ChunkMap::default();
+            for x in 0..8 {
+                map.insert((x, 0), Arc::new(Chunk::empty(0, 0)));
+            }
+            map
+        };
+        // Region 0 owns chunks 2..=5; the scope names a few more that are not loaded or not its.
+        let region = |(x, _): (i32, i32)| (2..=5).contains(&x).then_some(0);
+        let scope = [(1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0), (50, 0)];
+        let (mut walked, mut scoped) = (build(), build());
+        let by_walk = walked.lend(1, region, None);
+        let by_scope = scoped.lend(1, region, Some(&scope));
+        let keys = |m: &ChunkMap| {
+            let mut k: Vec<_> = m.keys().copied().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(&by_scope[0]), [(2, 0), (3, 0), (4, 0), (5, 0)]);
+        assert_eq!(keys(&by_scope[0]), keys(&by_walk[0]));
+        assert_eq!(keys(&scoped), keys(&walked));
+        assert_eq!(keys(&scoped), [(0, 0), (1, 0), (6, 0), (7, 0)]);
+        // The lookup grid agrees with the columns on both sides.
+        assert!(by_scope[0].get(&(3, 0)).is_some() && scoped.get(&(3, 0)).is_none());
+        assert!(scoped.get(&(1, 0)).is_some());
+    }
+
+    #[test]
     fn lent_columns_read_by_get_where_they_are_and_nowhere_else() {
         let mut map = ChunkMap::default();
         for x in 0..4 {
             map.insert((x, 0), Arc::new(Chunk::empty(x, 0)));
         }
-        let mut parts = map.lend(2, |(x, _)| Some((x / 2) as usize));
+        let mut parts = map.lend(2, |(x, _)| Some((x / 2) as usize), None);
         // A lent column is gone from the map it left, whatever its lookup grid remembers, and found in the map it
         // went to.
         assert!(map.get(&(0, 0)).is_none());
@@ -988,7 +1036,7 @@ mod tests {
             map.insert((x, 0), Arc::new(Chunk::empty(0, 0)));
         }
         let cursor = map.touch_cursor();
-        let parts = map.lend(1, |_| Some(0));
+        let parts = map.lend(1, |_| Some(0), None);
         for part in parts {
             map.take_back(part);
         }

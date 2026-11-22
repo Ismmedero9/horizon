@@ -41,6 +41,9 @@ pub(super) struct Regions {
     owned: FxHashMap<(i32, i32), usize>,
     /// How many regions the level has.
     pub count: usize,
+    /// The sections each region owns (`owned` by region): a split restricted to one region reads only these, not
+    /// the level's every chunk.
+    by_region: Vec<Vec<(i32, i32)>>,
     /// `owned` as a flat table over the sections' bounds, when that is small enough: every split of the level asks
     /// for each chunk's and entity's region (tens of thousands a tick), one array read each.
     grid: Option<Grid>,
@@ -207,9 +210,14 @@ impl Regions {
             owned.insert(key, r);
         }
         let grid = Grid::of(&owned);
+        let mut by_region: Vec<Vec<(i32, i32)>> = vec![Vec::new(); count];
+        for (&key, &r) in &owned {
+            by_region[r].push(key);
+        }
         Self {
             owned,
             count,
+            by_region,
             grid,
             only: std::sync::atomic::AtomicUsize::new(usize::MAX),
         }
@@ -237,6 +245,20 @@ impl Regions {
         } else {
             self.count
         }
+    }
+
+    /// Every chunk position in the sections region `k` owns: all the chunks it can hold, loaded or not.
+    pub(super) fn chunk_keys(&self, k: usize) -> Vec<(i32, i32)> {
+        let side = 1 << SECTION_SHIFT;
+        let mut keys = Vec::with_capacity(self.by_region.get(k).map_or(0, Vec::len) << (2 * SECTION_SHIFT));
+        for &(sx, sz) in self.by_region.get(k).into_iter().flatten() {
+            for dx in 0..side {
+                for dz in 0..side {
+                    keys.push(((sx << SECTION_SHIFT) + dx, (sz << SECTION_SHIFT) + dz));
+                }
+            }
+        }
+        keys
     }
 
     /// The region that owns chunk `(x, z)`.
@@ -1979,16 +2001,39 @@ impl Lending<'_> {
     }
 }
 
-/// Split a joined list without replacing the list's residency binding.
+/// What goes to each region from the items `take` removes: `at` an item's place, `lend` takes the items
+/// whose place a region owns out of the list (in its order) and says which region each went to.
+fn by_region<T>(
+    regions: &Lending<'_>,
+    at: impl Fn(&T) -> (f64, f64),
+    lend: impl FnOnce(&mut dyn FnMut(&T) -> bool) -> Vec<T>,
+) -> Vec<Vec<T>> {
+    let mut places: Vec<usize> = Vec::new();
+    let taken = lend(&mut |item| {
+        let (x, z) = at(item);
+        match regions.of_block(x, z) {
+            Some(r) => {
+                places.push(r);
+                true
+            }
+            None => false,
+        }
+    });
+    let mut out: Vec<Vec<T>> = (0..regions.parts()).map(|_| Vec::new()).collect();
+    for (item, r) in taken.into_iter().zip(places) {
+        out[r].push(item);
+    }
+    out
+}
+
+/// Split a joined list without replacing the list's residency binding. Only the items that move are touched:
+/// the ones that stay keep their place and their membership.
 fn split_list<T: Joined, const DIRECT: bool>(
     list: &mut JoinList<T, DIRECT>,
     regions: &Lending<'_>,
     at: impl Fn(&T) -> (f64, f64),
 ) -> Vec<Vec<T>> {
-    let mut all = list.drain(..).collect();
-    let out = split(&mut all, regions, at);
-    list.extend(all);
-    out
+    by_region(regions, at, |take| list.extract_if(take).collect())
 }
 
 fn split_resident<T: Joined>(
@@ -1996,10 +2041,7 @@ fn split_resident<T: Joined>(
     regions: &Lending<'_>,
     at: impl Fn(&T) -> (f64, f64),
 ) -> Vec<Vec<T>> {
-    let mut all = list.drain(..).collect();
-    let out = split(&mut all, regions, at);
-    list.append(&mut all.into_iter().collect());
-    out
+    by_region(regions, at, |take| list.extract_if(take).collect())
 }
 
 /// A map's entries whose block a region owns, moved into that region's map.
@@ -2082,13 +2124,24 @@ impl Game<'_> {
     /// entities moved out of this game's level; what no region owns stays, and so do the chunks the streaming has
     /// not finished, with what is in them ([`Lending`]).
     pub(super) fn split_level(&mut self, layout: &Regions) -> LevelSplit {
-        let held: FxHashSet<(i32, i32)> = self
-            .world
-            .chunks
-            .iter()
-            .filter(|(_, c)| !c.lit || !c.postprocess.is_empty())
-            .map(|(&key, _)| key)
-            .collect();
+        // A split restricted to one region reads the chunks of its sections alone, not the level's every chunk: the
+        // cost of a relend follows the region, not the level.
+        let scope: Option<Vec<(i32, i32)>> = layout.only_region().map(|k| layout.chunk_keys(k));
+        let unfinished = |c: &horizon_client::chunk::Chunk| !c.lit || !c.postprocess.is_empty();
+        let held: FxHashSet<(i32, i32)> = match &scope {
+            Some(keys) => keys
+                .iter()
+                .filter(|key| self.world.chunks.get(key).is_some_and(|c| unfinished(c)))
+                .copied()
+                .collect(),
+            None => self
+                .world
+                .chunks
+                .iter()
+                .filter(|(_, c)| unfinished(c))
+                .map(|(&key, _)| key)
+                .collect(),
+        };
         let regions = &Lending {
             layout,
             held: &held,
@@ -2100,9 +2153,22 @@ impl Game<'_> {
         // takes), or they would be added to chunks this game no longer holds once those went to a region.
         self.spawn_loaded_entities();
         let mut chunks: Vec<Vec<ChunkPos>> = vec![Vec::new(); n];
-        for &(x, z) in self.world.chunks.keys() {
-            if let Some(r) = of_chunk((x, z)) {
-                chunks[r].push(ChunkPos::new(x, z));
+        match &scope {
+            Some(keys) => {
+                for &(x, z) in keys {
+                    if self.world.chunks.contains_key(&(x, z))
+                        && let Some(r) = of_chunk((x, z))
+                    {
+                        chunks[r].push(ChunkPos::new(x, z));
+                    }
+                }
+            }
+            None => {
+                for &(x, z) in self.world.chunks.keys() {
+                    if let Some(r) = of_chunk((x, z)) {
+                        chunks[r].push(ChunkPos::new(x, z));
+                    }
+                }
             }
         }
         let seeds: Vec<i64> = (0..n)
@@ -2117,10 +2183,11 @@ impl Game<'_> {
             &mut self.random_tick_sections,
         );
         let (chunks_ref, seeds_ref, tick_seeds_ref) = (&chunks, &seeds, &tick_seeds);
+        let scope_ref = scope.as_deref();
         let (worlds, ticks, sections) = std::thread::scope(|scope| {
-            let worlds = scope.spawn(move || world.lend(n, of_chunk, seeds_ref));
+            let worlds = scope.spawn(move || world.lend(n, of_chunk, seeds_ref, scope_ref));
             let ticks = scope.spawn(move || block_ticks.lend(chunks_ref, tick_seeds_ref, first));
-            let sections = sections_of.lend(n, of_chunk);
+            let sections = sections_of.lend(n, of_chunk, scope_ref);
             match (worlds.join(), ticks.join()) {
                 (Ok(w), Ok(t)) => (w, t, sections),
                 (Err(e), _) | (_, Err(e)) => std::panic::resume_unwind(e),
@@ -2161,7 +2228,7 @@ impl Game<'_> {
         let mut jukebox_sounds = split_map(&mut self.jukebox_sounds, regions, |p| block_chunk(*p));
         let mut lid_openers = split_map(&mut self.lid_openers, regions, |p| block_chunk(*p));
         let mut knot_ids = split_map(&mut self.knot_ids, regions, array_chunk);
-        let mut scanned = self.creaking.split_scanned(n, |key| regions.of_chunk(key));
+        let mut scanned = self.creaking.split_scanned(n, |key| regions.of_chunk(key), scope_ref);
         let mut lectern_pulses: Vec<Vec<((i32, i32, i32), i32)>> =
             (0..n).map(|_| Vec::new()).collect();
         self.lectern_pulses
@@ -2254,6 +2321,18 @@ mod tests {
         assert_eq!(r.count, 2);
         assert_ne!(r.of_chunk((0, 0)), r.of_chunk((400, 0)));
         assert_eq!(r.of_chunk((200, 0)), None);
+    }
+
+    #[test]
+    fn a_regions_chunk_keys_are_the_chunks_of_the_sections_it_owns() {
+        let players = [(0, 0), (400, 0)];
+        let r = Regions::new(players, &players, 0);
+        for k in 0..r.count {
+            let keys = r.chunk_keys(k);
+            // A ticking section and the ring around it: 9 sections of 4 x 4 chunks.
+            assert_eq!(keys.len(), 9 * 16);
+            assert!(keys.iter().all(|&key| r.of_chunk(key) == Some(k)));
+        }
     }
 
     #[test]

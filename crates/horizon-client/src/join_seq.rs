@@ -450,6 +450,10 @@ impl<T: Joined> ResidentList<T> {
     pub fn retain_mut(&mut self, keep: impl FnMut(&mut T) -> bool) {
         self.0.retain_where(keep);
     }
+    /// The owners `take` selects, removed in list order; the others keep their place and their membership.
+    pub fn extract_if(&mut self, take: impl FnMut(&T) -> bool) -> std::vec::IntoIter<T> {
+        self.0.extract_if(take)
+    }
     pub fn clear(&mut self) {
         self.0.clear();
     }
