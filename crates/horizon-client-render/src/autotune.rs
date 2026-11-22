@@ -46,7 +46,7 @@ enum State {
     Watching,
     /// On for a trial: left out `SETTLE` windows, then measured against the frame before.
     Trial,
-    /// The trial made the frame faster: on from here.
+    /// The trial made the frame faster: on, until its frame stays clearly slower than before.
     Kept,
 }
 
