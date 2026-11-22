@@ -80,6 +80,12 @@ impl TickProfile {
         now
     }
 
+    /// Takes `spent` back out of `step`: time another step counted inside it.
+    pub fn exclude(&mut self, step: Step, spent: std::time::Duration) {
+        let c = &mut self.cur[step as usize];
+        *c = (*c - spent.as_secs_f32() * 1000.0).max(0.0);
+    }
+
     pub fn begin(&mut self) {
         self.started = Some(Instant::now());
     }

@@ -855,13 +855,15 @@ impl Game<'_> {
         let dim = self.dim;
         let mut entered = std::time::Instant::now();
         if self.regions.flight.as_ref().is_some_and(|f| f.0 == dim) {
-            self.finish_flight()?;
+            // Started early and still out: the tick's phases on what no region owns run meanwhile, and
+            // `finish_flight_here` waits for the regions before the server's hub ticks.
             return Ok(());
         }
         if let Some(set) = self.regions.resident.remove(&dim) {
             self.regions.prof.note_resident();
-            if let Some(set) = self.resident_tick(set, false)? {
-                self.regions.resident.insert(dim, set);
+            if let Some(flight) = self.resident_launch(set, false) {
+                // Out on their threads: the phases that follow overlap them (`finish_flight_here`).
+                self.regions.flight = Some((dim, flight));
                 return Ok(());
             }
             if !std::mem::take(&mut self.regions.resplit) {
@@ -1012,19 +1014,10 @@ impl Game<'_> {
         self.lan = Some(host);
         self.regions.prof.note_resident();
         self.regions.prof.add(Step::Split, entered);
-        if let Some(set) = self.resident_tick(set, true)? {
-            self.regions.resident.insert(dim, set);
+        if let Some(flight) = self.resident_launch(set, true) {
+            self.regions.flight = Some((dim, flight));
         }
         Ok(())
-    }
-
-    /// One tick of the resident regions `set`, on threads of their own; `None` once they are back (the tick ran
-    /// by landing them, or one of them failed).
-    fn resident_tick(&mut self, set: ResidentSet, first: bool) -> Result<Option<ResidentSet>> {
-        match self.resident_launch(set, first) {
-            Some(flight) => self.resident_finish(flight),
-            None => Ok(None),
-        }
     }
 
     /// Starts the tick of the resident regions `set` on their threads, without waiting for them: `None` once
@@ -1235,6 +1228,16 @@ impl Game<'_> {
         if let Some(flight) = self.resident_launch(set, false) {
             self.regions.flight = Some((dim, flight));
         }
+    }
+
+    /// [`Game::finish_flight`] for the level in place: the one whose regions the tick's phases overlapped, so the
+    /// wait is only for the part of their tick those phases did not cover. A flight of another level (a phase
+    /// that entered it and has not come back) is left for the level's own tick.
+    pub(super) fn finish_flight_here(&mut self) -> Result<()> {
+        if self.regions.flight.as_ref().is_some_and(|f| f.0 == self.dim) {
+            self.finish_flight()?;
+        }
+        Ok(())
     }
 
     /// Waits for the regions [`Game::launch_residents_early`] started (until the regions' deadline) and keeps

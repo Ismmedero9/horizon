@@ -4525,10 +4525,18 @@ impl Game<'_> {
         if let (Some(sent), Some(log)) = (sent, self.world.block_log.as_mut()) {
             self.world.block_log_held = log.split_off(sent.min(log.len()));
         }
+        // Regions started early have ticked meanwhile: the wait is for what the phases above did not cover. It is
+        // counted as `wait`, not as leftover.
+        let waiting = Instant::now();
+        self.finish_flight_here()?;
+        let waited = waiting.elapsed();
         let before_lan = self
             .regions
             .prof
             .add(region_profile::Step::Leftover, after_regions);
+        self.regions
+            .prof
+            .exclude(region_profile::Step::Leftover, waited);
         horizon_client::spans::time("tick_lan", || self.tick_lan(false));
         let after_lan = self.regions.prof.add(region_profile::Step::Lan, before_lan);
         let held = std::mem::take(&mut self.world.block_log_held);
