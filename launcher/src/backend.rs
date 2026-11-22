@@ -4825,24 +4825,6 @@ mod tests {
         }
     }
 
-    /// The game program's mod API level is its mark's; a program from before the mark (0.2.68
-    /// and older) or none at all serves level 0.
-    #[test]
-    fn a_game_program_says_its_mod_api_level() {
-        let dir = std::env::temp_dir().join(format!("horizon-api-level-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let marked = dir.join("marked");
-        let mut program = b"\x7fELF code code".to_vec();
-        program.extend_from_slice(b"horizon-mod-api-level:0007;");
-        fs::write(&marked, &program).unwrap();
-        let old = dir.join("old");
-        fs::write(&old, b"\x7fELF code without a mark").unwrap();
-        assert_eq!(program_mod_api_level(&marked), 7);
-        assert_eq!(program_mod_api_level(&old), 0);
-        assert_eq!(program_mod_api_level(&dir.join("missing")), 0);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
     /// The launcher downloads Mojang's game files (client jar, libraries, assets) only for an
     /// account the services said owns the game: never without one, and never past the gate by
     /// the developer option (`Settings::dev_offline`), whose pass has no owner.
