@@ -10242,6 +10242,7 @@ impl Game<'_> {
                                 ms(elapsed),
                                 ms(cpu),
                                 r.gpu_times.last().copied(),
+                                ms(r.last_wait),
                             );
                             if let Some(&gpu) = r.gpu_times.last() {
                                 self.gpu_utilization =
