@@ -451,6 +451,36 @@ fn builds_are_launchers(builds: &Path, data: &Path, location: Option<&Roots>) ->
     location.is_none() || builds.starts_with(data) || named(builds, "build")
 }
 
+/// Deletes the data folder and the build folder that goes with it, when the launcher made them.
+/// `builds` is asked first: a profile whose name isn't ASCII keeps its build folder in
+/// %ProgramData% under a random name that only `data` remembers (`backend::build_dir`), so once
+/// `data` is gone the name is gone with it.
+fn remove_data_and_builds(
+    data: &Path,
+    location: Option<&Roots>,
+    builds: impl FnOnce() -> PathBuf,
+    left: &mut Vec<String>,
+) {
+    // Only a folder the launcher made: `HORIZON_LAUNCHER_HOME` may point anywhere.
+    if !made_by_launcher(data, location) {
+        left.push(format!(
+            "{} (not the launcher's own folder)",
+            data.display()
+        ));
+        return;
+    }
+    let builds = builds();
+    remove_all(data, left);
+    if builds_are_launchers(&builds, data, location) {
+        remove_all(&builds, left);
+    } else {
+        left.push(format!(
+            "{} (not the launcher's own folder)",
+            builds.display()
+        ));
+    }
+}
+
 /// Takes the install away. Returns what could not be removed (a file in use, say).
 pub fn uninstall(remove_data: bool, progress: impl Fn(Step, f32)) -> Result<Vec<String>, String> {
     let dir = registered()
@@ -527,26 +557,7 @@ pub fn uninstall(remove_data: bool, progress: impl Fn(Step, f32)) -> Result<Vec<
         progress(Step::Data, 0.8);
         let data = backend::data_dir();
         let location = moved_location();
-        // Only a folder the launcher made: `HORIZON_LAUNCHER_HOME` may point anywhere.
-        if made_by_launcher(&data, location.as_ref()) {
-            remove_all(&data, &mut left);
-            // A profile whose name isn't ASCII keeps the build folder in %ProgramData%
-            // (`backend::build_dir`); it is the launcher's too. Already gone with `data` otherwise.
-            let builds = backend::build_dir();
-            if builds_are_launchers(&builds, &data, location.as_ref()) {
-                remove_all(&builds, &mut left);
-            } else {
-                left.push(format!(
-                    "{} (not the launcher's own folder)",
-                    builds.display()
-                ));
-            }
-        } else {
-            left.push(format!(
-                "{} (not the launcher's own folder)",
-                data.display()
-            ));
-        }
+        remove_data_and_builds(&data, location.as_ref(), backend::build_dir, &mut left);
     }
     progress(Step::Data, 1.0);
     Ok(left)
@@ -682,6 +693,33 @@ mod tests {
             Path::new(r"D:\Elsewhere\launcher"),
             Some(&moved)
         ));
+    }
+
+    /// The private build folder of a profile whose name isn't ASCII is named only in
+    /// `<data>/build-folder.txt`: uninstalling removes that folder as well, not a new one made
+    /// after the data folder is gone.
+    #[test]
+    fn uninstall_removes_the_private_build_folder_named_in_the_data_folder() {
+        let root = std::env::temp_dir().join(format!("horizon-uninstall-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let data = root.join("horizon-launcher");
+        let public = root.join("ProgramData");
+        let name = "horizon-launcher-0123456789abcdef0123456789abcdef";
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(public.join(name).join("toolchain")).unwrap();
+        fs::write(data.join("build-folder.txt"), name).unwrap();
+        let find = || {
+            let remembered = fs::read_to_string(data.join("build-folder.txt"))
+                .unwrap_or_else(|_| "horizon-launcher-made-after-the-data-is-gone".into());
+            public.join(remembered.trim())
+        };
+        let mut left = Vec::new();
+        remove_data_and_builds(&data, None, find, &mut left);
+        assert!(left.is_empty(), "{left:?}");
+        assert!(!data.exists());
+        assert!(!public.join(name).exists(), "the build folder stayed");
+        assert_eq!(fs::read_dir(&public).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// What the shell itself reads as the shortcut's target: the field Explorer starts from.
