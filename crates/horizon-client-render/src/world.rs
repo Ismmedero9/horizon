@@ -395,9 +395,9 @@ impl World {
         scope: Option<&[(i32, i32)]>,
     ) -> Vec<World> {
         let chunks = self.chunks.lend(regions, &region_of, scope);
-        let mut entities = self
-            .block_entities
-            .lend(regions, |p| region_of((p.0 >> 4, p.2 >> 4)), scope);
+        let mut entities =
+            self.block_entities
+                .lend(regions, |p| region_of((p.0 >> 4, p.2 >> 4)), scope);
         let mut inhabited: Vec<FxHashMap<(i32, i32), i64>> =
             (0..regions).map(|_| FxHashMap::default()).collect();
         match scope {

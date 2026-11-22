@@ -516,8 +516,24 @@ fn attach(mixer: &Mutex<Mixer>, channel: ChannelId, samples: Samples, looping: b
 }
 /// The open output stream. A build without the `audio` feature (the server build, which must not
 /// need libasound) never has one.
+///
+/// A thread of its own holds cpal's stream: CoreAudio's is not `Send`, and a `Game`, which holds its
+/// `Audio`, has to be, since regions move server games between threads. Dropping this stops that
+/// thread and waits for it, so the device is let go before a new stream opens, as before.
 #[cfg(feature = "audio")]
-type Stream = cpal::Stream;
+struct Stream {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+#[cfg(feature = "audio")]
+impl Drop for Stream {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 #[cfg(not(feature = "audio"))]
 type Stream = std::convert::Infallible;
 /// A level sound retained for the network broadcaster, in playback order.
@@ -1783,7 +1799,7 @@ impl Audio {
         }
         let mixer = Arc::new(Mutex::new(Mixer::default()));
         let opened = if output {
-            Self::open_named(mixer.clone(), target_device)
+            Self::open_output(mixer.clone(), target_device)
         } else {
             Err("no output on a dedicated server".into())
         };
@@ -1857,8 +1873,47 @@ impl Audio {
     fn open_named(_: Arc<Mutex<Mixer>>, _: &str) -> Result<Stream> {
         Err("this build has no sound output (built without the `audio` feature)".into())
     }
+    /// Opens the output on a thread that then holds it (`Stream`).
     #[cfg(feature = "audio")]
-    fn open_named(mixer: Arc<Mutex<Mixer>>, target: &str) -> Result<Stream> {
+    fn open_output(mixer: Arc<Mutex<Mixer>>, target: &str) -> Result<Stream> {
+        let target = target.to_owned();
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name("Audio output".into())
+            .spawn(move || match Self::open_named(mixer, &target) {
+                Ok(stream) => {
+                    let _ = opened_tx.send(Ok(()));
+                    // Until the `Audio` lets go of it: its sender drops.
+                    let _ = stopped.recv();
+                    drop(stream);
+                }
+                Err(e) => {
+                    let _ = opened_tx.send(Err(e.to_string()));
+                }
+            })?;
+        let opened = opened_rx.recv();
+        match opened {
+            Ok(Ok(())) => Ok(Stream {
+                stop: Some(stop),
+                thread: Some(thread),
+            }),
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                Err(e.into())
+            }
+            Err(_) => {
+                let _ = thread.join();
+                Err("the audio output thread stopped".into())
+            }
+        }
+    }
+    #[cfg(not(feature = "audio"))]
+    fn open_output(mixer: Arc<Mutex<Mixer>>, target: &str) -> Result<Stream> {
+        Self::open_named(mixer, target)
+    }
+    #[cfg(feature = "audio")]
+    fn open_named(mixer: Arc<Mutex<Mixer>>, target: &str) -> Result<cpal::Stream> {
         if let Some(reason) = output_disabled(|name| std::env::var_os(name)) {
             return Err(reason.into());
         }
@@ -1897,7 +1952,7 @@ impl Audio {
             self.device_name = name.to_owned();
             return Ok(());
         }
-        self._stream = Some(Self::open_named(self.backend.mixer.clone(), name)?);
+        self._stream = Some(Self::open_output(self.backend.mixer.clone(), name)?);
         self.device_name = name.to_owned();
         self.backend.live = true;
         self.engine.loaded = true;
@@ -1910,7 +1965,7 @@ impl Audio {
         Ok(())
     }
     #[cfg(feature = "audio")]
-    fn open(mixer: Arc<Mutex<Mixer>>) -> Result<Stream> {
+    fn open(mixer: Arc<Mutex<Mixer>>) -> Result<cpal::Stream> {
         if let Some(reason) = output_disabled(|name| std::env::var_os(name)) {
             return Err(reason.into());
         }
