@@ -901,15 +901,19 @@ is on: that setting alone never splits the world into regions.
 [regions]
 enabled = true
 deadline_ms = 50             # how long a tick waits for its regions; a slower one keeps going and comes home later
-resident_ticks = 20          # ticks a region stays on its thread before it comes home to be split anew
 ```
+
+A region stays on its thread. It owns the part of the level its players are in, and it splits and merges by itself:
+when its players walk apart, it hands the far ones' chunks, entities and players to a region of its own at the end of
+its tick; when two regions come within a few chunks of each other, they pause at the next tick boundary and one
+absorbs the other. Nothing brings a region home on a timer (`resident_ticks`, which did, is gone: a `server.toml`
+that still sets it loads and ignores it).
 
 `/tps` (TPS and tick times, and each region's last tick) and `/mspt` are Horizon's own commands. A dedicated server
 always has them (operators only), whether or not `horizon-pregen` is on.
 
 The environment variables still override it: `HORIZON_PARALLEL_TICK=0` keeps every tick serial, `HORIZON_REGIONS=0` or
-`HORIZON_REGION_THREADS=0` keep the older parallel tick without regions (`HORIZON_REGIONS=1` is what `enabled = true` sets), and `HORIZON_REGION_DEADLINE_MS` and `HORIZON_RESIDENT_TICKS` set the two
-numbers.
+`HORIZON_REGION_THREADS=0` keep the older parallel tick without regions (`HORIZON_REGIONS=1` is what `enabled = true` sets), and `HORIZON_REGION_DEADLINE_MS` sets the deadline.
 
 #### What changes with regions on
 
@@ -927,7 +931,7 @@ Region ticking trades some of vanilla's behaviour for speed, the way other regio
   their next tick). It brings no region home, unless a native mod has to see it first, or the chat filter refuses it
   (or someone is muted): the server's thread then handles it.
 - **Command blocks** reach only the chunks and players of the region they are in.
-- **Scores** a region's players change reach the clients when the region comes home (within `resident_ticks`).
+- **Scores** a region's players change reach the clients when the region comes home.
 - **Raids and the dragon fight** run on the server's thread: a level with a raid near a player, and the End until its
   dragon is killed, are not split. A raid a player starts in a region brings that region home.
 - **The level-wide spawners** (wandering trader, pillager patrols, cats, phantoms, zombie sieges) count down in each
@@ -939,9 +943,11 @@ Region ticking trades some of vanilla's behaviour for speed, the way other regio
   region, `level_tick_post` reads of their chunks, and the Input and Sneak events of their players are not
   delivered yet.
 - **Light** at the border of a region is worked out again when the region comes home.
-- **New terrain** around a player in a region is generated and lit on the server's thread and reaches the player
-  once the region has come home for it (one or two `resident_ticks` periods), so a player who teleports to new
-  ground waits a little longer for it.
+- **New terrain** around a player in a region is generated and lit on the server's thread. A region whose players
+  see terrain it was not lent comes home alone when the server has some of it (at most every few ticks), and is lent
+  again with it; so does a region whose area grew or shrank because its players moved. A player who teleports to
+  new ground waits a little longer for it. These landings are the ones left for regions that load and light their own
+  chunks.
 
 A region that panics comes home and the level ticks whole for 200 ticks before it is split again; the log says
 `a region of <level> failed`. A save that writes none of the entities in memory logs `regions: save lost entities`:

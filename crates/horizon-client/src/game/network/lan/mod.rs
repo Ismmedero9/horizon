@@ -145,6 +145,8 @@ impl LanHost {
         dim: super::Dim,
         guests: Vec<horizon_client::lan::guest::Guest>,
     ) {
+        // A shell kept from another level (a spare game is reused) holds that level's players.
+        r.hub.set_dimension(&self.hub.config.dimension.clone());
         r.hub.copy_region_settings(&self.hub);
         r.native_commands_sent = self.native_commands_sent;
         r.sleep_ignored = self.sleep_ignored.clone();
@@ -171,6 +173,24 @@ impl LanHost {
                 region_states.insert(*id, s);
             }
         }
+    }
+
+    /// Region host `r`, merged into this region's: its players and what is kept for them and their mobs.
+    pub(super) fn take_peer_region(&mut self, r: &mut LanHost) {
+        self.hub.take_peer_guests(&mut r.hub);
+        self.play.extend(r.play.drain());
+        self.menus.extend(r.menus.drain());
+        self.poses.extend(r.poses.drain());
+        self.mob_players.extend(r.mob_players.drain());
+        for (dim, states) in r.mob_state.iter_mut() {
+            self.mob_state
+                .entry(*dim)
+                .or_default()
+                .extend(states.drain());
+        }
+        self.broken.append(&mut r.broken);
+        self.commands.append(&mut r.commands);
+        self.quiet.extend(r.quiet.drain(..));
     }
 
     /// Region host `r`'s players back, with what their region's tick left for the server's host.

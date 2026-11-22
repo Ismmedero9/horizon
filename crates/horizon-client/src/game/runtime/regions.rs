@@ -6,14 +6,23 @@
 //! touches. A region owns its sections and a ring of one section around each ticking one, so two regions' chunks
 //! never meet and a region's ticks find the chunks next to theirs.
 //!
-//! [`Regions`] decides which region owns what. The rest of the module ticks them (`[regions]`, off by default):
-//! a level with players in two or more separate areas is split, and each region's chunks, entities, block
-//! entities and players are lent to a pooled region game (`region_pool.rs`) that ticks them on a thread of its
-//! own, its players' packets included. A set of regions stays resident between ticks and lands (every part comes
-//! home to the server's game) every few periods, or when the server's thread has something to do with a player
-//! or a chunk of theirs (a command, a join or leave, a death, a native mod's hook); one region may come home alone.
-//! The server's thread waits for them to the region deadline, runs the serial phases on what it still holds,
-//! and sums what they report (the night skip's sleep counts, `/tps`' numbers).
+//! [`Regions`] decides which region owns what when a level is first split. The rest of the module ticks them
+//! (`[regions]`, off by default): a level with players in two or more separate areas is split, and each
+//! region's chunks, entities, block entities and players are lent to a pooled region game (`region_pool.rs`)
+//! that ticks them on a thread of its own, its players' packets included.
+//!
+//! A region then keeps its part of the level. Who owns each section is in a [`SectionMap`]
+//! (`region_map.rs`) that every region thread reads and claims from. At the end of its own tick a region works
+//! out the area its players and ticking chunks need: a region whose sections fall into separate groups splits
+//! itself ([`Game::split_off_groups`], the new region takes a spare game from [`Spares`]), and a region that
+//! comes within the merge radius of another is merged with it at the next tick boundary, one absorbing the other
+//! ([`Game::absorb_region`]). No timer brings a region home: it lands (every part comes home to the server's game)
+//! only when the server's thread has something to do with a player or a chunk of theirs (a command, a join or
+//! leave, a death, a native mod's hook, terrain that was not ready when the region was lent, an area that
+//! changed); one region may come home alone. The server's thread waits for them to the region deadline, runs
+//! the serial phases on what it still holds, and sums what they report (the night skip's sleep counts, `/tps`'
+//! numbers).
+use super::region_map::{Area, Claim, Kind, RegionId, SectionMap};
 use super::region_profile::Step;
 use super::{Dim, Game, Mob, Resources};
 use horizon_client::Result;
@@ -22,7 +31,7 @@ use horizon_core::fast_hash::{FxHashMap, FxHashSet};
 use horizon_core::position::ChunkPos;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// A region's game moves to a thread of its own: `Game` has to be `Send` (checked when this compiles).
 const _: fn() = || {
@@ -47,8 +56,14 @@ pub(super) struct Regions {
     /// `owned` as a flat table over the sections' bounds, when that is small enough: every split of the level asks
     /// for each chunk's and entity's region (tens of thousands a tick), one array read each.
     grid: Option<Grid>,
-    /// While one resident region is split out again alone: the only region that owns anything (`usize::MAX`:
-    /// all of them). Read by the server's thread only.
+    /// The kind of each section a region owns (`by_region` with its kinds): what a region claims in the
+    /// [`SectionMap`] when it is lent.
+    kinds: Vec<Area>,
+    /// Added to the number of the first part a split makes, so the regions of a split made later keep ranges of
+    /// their own for sub-ticks and block entity ids ([`Game::split_level`]).
+    band: usize,
+    /// While one region is split out alone: the only region that owns anything (`usize::MAX`: all of them).
+    /// Read by the thread that splits only.
     only: std::sync::atomic::AtomicUsize,
 }
 
@@ -211,25 +226,50 @@ impl Regions {
         }
         let grid = Grid::of(&owned);
         let mut by_region: Vec<Vec<(i32, i32)>> = vec![Vec::new(); count];
+        let mut kinds: Vec<Area> = vec![Area::default(); count];
         for (&key, &r) in &owned {
             by_region[r].push(key);
+            kinds[r].insert(
+                key,
+                match kind.get(&key) {
+                    Some(&TICKING) => Kind::Ticking,
+                    Some(_) => Kind::View,
+                    None => Kind::Ring,
+                },
+            );
         }
         Self {
             owned,
             count,
             by_region,
             grid,
+            kinds,
+            band: 0,
             only: std::sync::atomic::AtomicUsize::new(usize::MAX),
         }
     }
 
-    /// From now on only region `k` (or all of them, `None`) owns chunks: a split of the level then moves out
-    /// that region's part alone, as part 0 of one.
-    fn restrict(&self, k: Option<usize>) {
-        self.only.store(k.unwrap_or(usize::MAX), Ordering::Relaxed);
+    /// The one region that owns `area`, split out alone: the layout of a region that is lent again, or carved out
+    /// of another (`band`: see [`Regions::band`]).
+    fn for_area(area: &Area, band: usize) -> Self {
+        let owned: FxHashMap<(i32, i32), usize> = area.keys().map(|&s| (s, 0)).collect();
+        Self {
+            by_region: vec![area.keys().copied().collect()],
+            kinds: vec![area.clone()],
+            owned,
+            count: 1,
+            grid: None,
+            band,
+            only: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 
-    /// The region a split is restricted to, if it is ([`Regions::restrict`]).
+    /// The sections region `k` owns, with their kinds.
+    fn area_of(&self, k: usize) -> Area {
+        self.kinds.get(k).cloned().unwrap_or_default()
+    }
+
+    /// The region a split is restricted to, if it is ([`Regions::for_area`]).
     fn only_region(&self) -> Option<usize> {
         match self.only.load(Ordering::Relaxed) {
             usize::MAX => None,
@@ -276,16 +316,6 @@ impl Regions {
     }
 }
 
-/// Entity ids a region game takes from the shared counter at a time, and how few it may have left before a tick
-/// before it takes more (no tick hands out anywhere near that many).
-const ID_BLOCK: u32 = 1 << 20;
-const ID_REFILL: u32 = 1 << 15;
-/// Ticks a level stays unsplit after one of its regions failed.
-const FAILED_PAUSE: u32 = 200;
-
-/// The most block changes one region lights in its tick; the rest wait for the next.
-const REGION_RELIGHT_PER_TICK: usize = 1024;
-
 /// What a game keeps for ticking by regions: whether it is a region's game, its handle on the resources that
 /// outlives the server's borrow, the end of its block of entity ids, and the games made for regions and kept.
 #[derive(Default)]
@@ -298,8 +328,11 @@ pub(super) struct RegionState {
     pub entity_id_end: u32,
     /// The server's shared counter the blocks of entity ids come from.
     pub entity_pool: Option<Arc<AtomicU32>>,
-    /// Region games made and not in use, by dimension.
-    pub idle: std::collections::HashMap<Dim, Vec<Box<Game<'static>>>>,
+    /// Region games made and not in use: the server's thread stocks them, region threads take one to split off a
+    /// region of their own.
+    pub spares: Arc<Spares>,
+    /// The ids of the regions made so far, shared by every region ([`RegionId`]).
+    ids: Arc<AtomicU64>,
     /// Region games being made on threads of their own (making one reads files and builds a whole game: a stall
     /// of seconds on the server's thread), taken in once made.
     factory: Vec<std::sync::mpsc::Receiver<std::result::Result<Box<Game<'static>>, String>>>,
@@ -307,9 +340,6 @@ pub(super) struct RegionState {
     pub resident: std::collections::HashMap<Dim, ResidentSet>,
     /// A level's resident regions started before its server-side work, waited for by its world tick.
     flight: Option<(Dim, Flight)>,
-    /// The regions just came home for nothing the server's thread has to do (their age, a player near the edge
-    /// of its region): the level is split again in the same tick, instead of ticking whole on this thread.
-    resplit: bool,
     /// Ticks left before the level may be split again after a region failed.
     paused: u32,
     /// How many entities the level held (here and in resident regions) when the save began, before the regions
@@ -318,23 +348,89 @@ pub(super) struct RegionState {
     /// What native mods sent to players who are away in a region (a clientbound packet, whether it is for a
     /// Horizon client only): delivered to the region's player before its next tick.
     pub(super) away_out: Vec<(u128, horizon_protocol::packets::play::Clientbound, bool)>,
-    /// Counts the resident regions' slots made, for their `uid`s.
-    slot_uids: u64,
     /// Where the server thread's tick time goes while regions are resident.
     pub(super) prof: super::region_profile::TickProfile,
+    /// A region game's own part: where it stands among its level's regions.
+    link: Option<RegionLink>,
+    /// The sections this region game owns, as it last claimed them in the level's [`SectionMap`].
+    area: Area,
+    /// What the area was worked out from last (players' places, ticking chunks), so a tick where nothing moved
+    /// skips the work.
+    topology_seen: Option<u64>,
+}
+
+/// Region games made and not in use.
+#[derive(Default)]
+pub(super) struct Spares {
+    games: std::sync::Mutex<Vec<Box<Game<'static>>>>,
+    /// How many more a region thread found missing when it wanted to split: the server's thread makes them.
+    wanted: AtomicUsize,
+}
+
+impl Spares {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Box<Game<'static>>>> {
+        self.games
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// A game for a region that splits off.
+    fn take(&self) -> Option<Box<Game<'static>>> {
+        let game = self.lock().pop();
+        if game.is_none() {
+            self.wanted.fetch_add(1, Ordering::Relaxed);
+        }
+        game
+    }
+    fn give(&self, mut game: Box<Game<'static>>) {
+        game.regions.link = None;
+        game.regions.area.clear();
+        game.regions.topology_seen = None;
+        self.lock().push(game);
+    }
+    fn len(&self) -> usize {
+        self.lock().len()
+    }
+}
+
+/// Where a resident region stands among its level's: what its own thread needs to claim sections, split and ask
+/// for a merge without the server's thread.
+#[derive(Clone)]
+struct RegionLink {
+    shared: Arc<SetShared>,
+    id: RegionId,
+    spares: Arc<Spares>,
+    ids: Arc<AtomicU64>,
+    pool: Arc<AtomicU32>,
+}
+
+/// What one level's resident regions share.
+#[derive(Default)]
+struct SetShared {
+    /// Who owns each section.
+    map: SectionMap,
+    /// Pairs of regions within the merge radius of each other (the smaller id first), found by their own threads:
+    /// the server's thread merges them at the next tick boundary.
+    merges: std::sync::Mutex<std::collections::BTreeSet<(RegionId, RegionId)>>,
+}
+
+impl SetShared {
+    fn ask_merge(&self, a: RegionId, b: RegionId) {
+        if a != b {
+            self.merges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert((a.min(b), a.max(b)));
+        }
+    }
 }
 
 /// A level's regions that stay on their threads between ticks.
 pub(super) struct ResidentSet {
     games: Vec<Slot>,
-    /// Each region's chunks when it was lent.
-    chunks: Vec<Vec<ChunkPos>>,
-    /// All of `chunks`, for the streamer: lent columns are loaded, only not in the server's world.
+    /// All of the regions' chunks, for the streamer: lent columns are loaded, only not in the server's world.
     lent: Arc<horizon_client::fast_hash::FxHashSet<(i32, i32)>>,
-    /// The layout they were lent in: what their players' views must stay inside.
-    layout: Arc<Regions>,
-    /// Ticks since they were all lent: the set comes home whole and is split anew every few periods.
-    age: u32,
+    /// The sections' owners.
+    shared: Arc<SetShared>,
 }
 
 /// Resident regions started on their threads this tick, not yet waited for.
@@ -347,12 +443,37 @@ struct Flight {
     started: std::time::Instant,
 }
 
+/// What a region's tick sends back with its game.
+struct Done {
+    game: Box<Game<'static>>,
+    result: std::result::Result<(), String>,
+    took: f32,
+    report: Report,
+}
+
+/// What a region found at the end of its tick, for the server's thread.
+#[derive(Default)]
+struct Report {
+    /// Regions it split off.
+    born: Vec<Born>,
+    /// The connections of its players after that, when it split.
+    conns: Option<Vec<u32>>,
+    /// Why it has to come home alone: its area changed (the chunks of what it claimed are in the server's game),
+    /// or it has no player left.
+    wants: Option<&'static str>,
+}
+
+/// A region a region split off: its game with its players, and its id in the map.
+struct Born {
+    game: Box<Game<'static>>,
+    id: RegionId,
+    conns: Vec<u32>,
+}
+
 /// One resident region: its game when it is home, or the channel its thread sends it back on while it ticks.
 struct Slot {
     game: Option<Box<Game<'static>>>,
-    running: Option<
-        std::sync::mpsc::Receiver<(Box<Game<'static>>, std::result::Result<(), String>, f32)>,
-    >,
+    running: Option<std::sync::mpsc::Receiver<Done>>,
     /// Where its players stood when it was last home: the areas the server keeps loaded for them.
     places: Vec<(i32, i32)>,
     /// When its tick started, and when the watchdog last told of it.
@@ -361,8 +482,6 @@ struct Slot {
     /// How long its last tick took (ms) and how many chunks it held then.
     took: f32,
     chunks: usize,
-    /// Ticks since this region was lent: it comes home alone at `resident_period`, each at its own phase.
-    age: u32,
     /// Its part of the level and its players are home, ticking with the server's thread this tick; it is lent
     /// again at the start of the next.
     landed: bool,
@@ -374,10 +493,20 @@ struct Slot {
     players: Vec<AwayPlayer>,
     /// Its players' sleep counts as it last reported them.
     sleep: (i64, i64, i64),
-    /// Names it among the regions ([`Game::route_region_chat`]).
-    uid: u64,
+    /// Its id in the level's [`SectionMap`], and the name it has among the regions ([`Game::route_region_chat`]).
+    uid: RegionId,
     /// Chat lines said elsewhere for its players, sent when it is next lent or lands.
     mail: Vec<horizon_client::lan::hub::chat::RegionChat>,
+    /// Why its own thread asked for it to come home ([`Report::wants`]).
+    wants: Option<&'static str>,
+    /// Some of the terrain in its players' views was not lent with it (not loaded or not finished yet): it comes
+    /// home to be lent again once the server's game holds some.
+    owed: bool,
+    /// Ticks before the terrain it is owed may bring it home again, so terrain that arrives chunk by chunk
+    /// comes in batches.
+    terrain_wait: u32,
+    /// The regions it split off, until the set takes them in.
+    born: Vec<Born>,
 }
 
 pub(super) struct AwayPlayer {
@@ -387,7 +516,7 @@ pub(super) struct AwayPlayer {
 }
 
 impl Slot {
-    fn new(game: Box<Game<'static>>, uid: u64) -> Self {
+    fn new(game: Box<Game<'static>>, uid: RegionId) -> Self {
         Self {
             uid,
             mail: Vec::new(),
@@ -398,12 +527,15 @@ impl Slot {
             told: None,
             took: 0.0,
             chunks: 0,
-            age: 0,
             landed: false,
             fresh: false,
             conns: Vec::new(),
             players: Vec::new(),
             sleep: (0, 0, 0),
+            wants: None,
+            owed: false,
+            terrain_wait: 0,
+            born: Vec::new(),
         }
     }
     /// Takes the game in if its thread finished (waiting until `until`, or for good when None); false while it
@@ -427,7 +559,12 @@ impl Slot {
             }
         };
         match got {
-            Ok((game, result, took)) => {
+            Ok(Done {
+                game,
+                result,
+                took,
+                report,
+            }) => {
                 self.running = None;
                 self.took = took;
                 self.chunks = game.world.chunks.len();
@@ -436,6 +573,13 @@ impl Slot {
                     .as_ref()
                     .map(|h| h.hub.guests.iter().map(|g| g.chunk()).collect())
                     .unwrap_or_default();
+                if let Some(conns) = report.conns {
+                    self.conns = conns;
+                }
+                if report.wants.is_some() {
+                    self.wants = report.wants;
+                }
+                self.born.extend(report.born);
                 self.game = Some(game);
                 result.map(|()| true)
             }
@@ -448,6 +592,46 @@ impl Slot {
     }
 }
 
+impl ResidentSet {
+    /// The regions the slots' threads split off since, as slots of their own.
+    fn take_in_born(&mut self) {
+        let mut born = Vec::new();
+        for slot in &mut self.games {
+            born.append(&mut slot.born);
+        }
+        for b in born {
+            // Its terrain is the part of its parent's that its players see: owed the same way.
+            let owed = terrain_owed(&b.game, &self.lent);
+            let mut slot = Slot::new(b.game, b.id);
+            slot.conns = b.conns;
+            slot.fresh = true;
+            slot.owed = owed;
+            slot.terrain_wait = TERRAIN_GAP;
+            self.games.push(slot);
+        }
+    }
+}
+
+/// Entity ids a region game takes from the shared counter at a time, and how few it may have left before a tick
+/// before it takes more (no tick hands out anywhere near that many).
+const ID_BLOCK: u32 = 1 << 20;
+const ID_REFILL: u32 = 1 << 15;
+/// Ticks a level stays unsplit after one of its regions failed.
+const FAILED_PAUSE: u32 = 200;
+
+/// The most block changes one region lights in its tick; the rest wait for the next.
+const REGION_RELIGHT_PER_TICK: usize = 1024;
+
+/// Sections a region may hold that its players and ticking chunks no longer need before it gives them up: the
+/// area follows the players in steps, not at every section they cross.
+const SHRINK_SLACK: usize = 24;
+
+/// Ticks between two landings of a region for terrain it is owed.
+const TERRAIN_GAP: u32 = 5;
+
+/// Region games kept ready for a region to split off into.
+const SPARE_GAMES: usize = 1;
+
 /// How long a tick waits for its regions (`HORIZON_REGION_DEADLINE_MS`, 50): one that runs longer keeps going
 /// on its own thread and its players are ticked again once it is home, so a slow region does not hold the others.
 fn region_deadline() -> std::time::Duration {
@@ -459,21 +643,6 @@ fn region_deadline() -> std::time::Duration {
             .unwrap_or(50)
     }))
 }
-
-/// Ticks between the resident regions' returns (`HORIZON_RESIDENT_TICKS`, 20 by default).
-fn resident_period() -> u32 {
-    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("HORIZON_RESIDENT_TICKS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(20)
-            .max(1)
-    })
-}
-
-/// Ticks of `resident_period` between the resident set coming home whole to be split anew.
-const RESIDENT_REFRESH: u32 = 10;
 
 /// Which resident regions have to come home: all of them, or those named (with the reason).
 enum Land {
@@ -524,6 +693,18 @@ impl Game<'_> {
         }
     }
 
+    /// Keeps [`SPARE_GAMES`] ready, and as many more as region threads found missing: a region splits itself at
+    /// the end of its tick and takes a game for the new region from them.
+    fn stock_spares(&mut self) {
+        self.collect_region_games();
+        let wanted = self.regions.spares.wanted.swap(0, Ordering::Relaxed);
+        let have = self.regions.spares.len() + self.regions.factory.len();
+        let want = (SPARE_GAMES + wanted).min(4);
+        if have < want {
+            self.request_region_games(want - have);
+        }
+    }
+
     /// The region games made since, set up for the level in place and kept.
     fn collect_region_games(&mut self) {
         let mut i = 0;
@@ -537,7 +718,7 @@ impl Game<'_> {
                             w.regions.worker = true;
                             w.next_entity = 0;
                             w.regions.entity_id_end = 0;
-                            self.regions.idle.entry(self.dim).or_default().push(w);
+                            self.regions.spares.give(w);
                         }
                         Err(e) => log::warn!("a region game could not be made: {e}"),
                     }
@@ -856,8 +1037,8 @@ impl Game<'_> {
     /// The world phases of this tick by regions, on threads of their own. With players in two or more separate
     /// areas of the level, it is split into regions: each region's chunks, entities and players move into a
     /// region game that keeps them (a resident region) and ticks them on a thread of its own, its players' packets
-    /// and network turn included. They come back every `resident_period` ticks, or when something needs the
-    /// server's thread (a chat line or command, a join or leave, a death, a player leaving its region).
+    /// and network turn included. They stay there, splitting and merging by themselves, and come back only when
+    /// something needs the server's thread (a chat line or command, a join or leave, a death).
     /// The serial phases that follow always run, on what this thread still holds: what no region owns, and the
     /// whole level in a tick the regions are back.
     pub(super) fn tick_world_regions(&mut self) -> Result<()> {
@@ -883,7 +1064,7 @@ impl Game<'_> {
             return Ok(());
         }
         let dim = self.dim;
-        let mut entered = std::time::Instant::now();
+        let entered = std::time::Instant::now();
         if self.regions.flight.as_ref().is_some_and(|f| f.0 == dim) {
             // Started early and still out: the tick's phases on what no region owns run meanwhile, and
             // `finish_flight_here` waits for the regions before the server's hub ticks.
@@ -894,12 +1075,10 @@ impl Game<'_> {
             if let Some(flight) = self.resident_launch(set, false) {
                 // Out on their threads: the phases that follow overlap them (`finish_flight_here`).
                 self.regions.flight = Some((dim, flight));
-                return Ok(());
             }
-            if !std::mem::take(&mut self.regions.resplit) {
-                return Ok(());
-            }
-            entered = std::time::Instant::now();
+            // Landed whole (something needs the server's thread): the level ticks on this thread, and is split
+            // again at the start of the next tick.
+            return Ok(());
         }
         // A player a command or a native mod just sent to another level waits for the server's hand to move them
         // (`run_level_teleports`, later in this tick): lent to a region now, they would not be found and the
@@ -953,7 +1132,7 @@ impl Game<'_> {
         }
         // Games for the regions: made on demand, kept for the next ticks.
         self.collect_region_games();
-        let have = self.regions.idle.get(&dim).map_or(0, Vec::len);
+        let have = self.regions.spares.len();
         if have < regions.count {
             // Not enough games yet: they are made meanwhile, and this tick runs as one.
             let coming = self.regions.factory.len();
@@ -963,9 +1142,9 @@ impl Game<'_> {
             }
             return Ok(());
         }
-        let mut games = self.regions.idle.remove(&dim).unwrap_or_default();
-        let extra: Vec<Box<Game<'static>>> = games.split_off(regions.count);
-        self.regions.idle.insert(dim, extra);
+        let games: Vec<Box<Game<'static>>> = (0..regions.count)
+            .filter_map(|_| self.regions.spares.take())
+            .collect();
         let pool = Arc::clone(
             self.regions
                 .entity_pool
@@ -1002,21 +1181,26 @@ impl Game<'_> {
             .hub
             .lend_trackers(regions.count, |chunk| regions.of_chunk(chunk))
             .into_iter();
-        let split = self.split_level(&regions);
-        let regions_count = regions.count;
+        let split = self.split_level(&regions, true);
+        let shared = Arc::new(SetShared::default());
         let mut set = ResidentSet {
             games: Vec::with_capacity(regions.count),
-            chunks: Vec::with_capacity(regions.count),
             lent: Default::default(),
-            layout: Arc::new(regions),
-            age: 0,
+            shared: Arc::clone(&shared),
         };
-        for ((part, mut w), (chunks, guests)) in split.parts.into_iter().zip(games).zip(
-            split
-                .chunks
-                .into_iter()
-                .zip(split_guests.iter_mut().map(std::mem::take)),
-        ) {
+        let mut lent: FxHashSet<(i32, i32)> = FxHashSet::default();
+        for (k, ((part, mut w), (chunks, guests))) in split
+            .parts
+            .into_iter()
+            .zip(games)
+            .zip(
+                split
+                    .chunks
+                    .into_iter()
+                    .zip(split_guests.iter_mut().map(std::mem::take)),
+            )
+            .enumerate()
+        {
             let mob_ids: Vec<u32> = part.mobs.iter().map(|m| m.id).collect();
             self.lend_region(&mut w, part);
             // The level's own settings: a game made for another dimension earlier is this one's now.
@@ -1032,16 +1216,32 @@ impl Game<'_> {
             }
             w.lan = Some(shell);
             w.bind_lan_residents();
-            self.regions.slot_uids += 1;
-            let mut slot = Slot::new(w, self.regions.slot_uids);
+            // The region claims its sections in the level's map: from here on it owns them.
+            let id = self.regions.ids.fetch_add(1, Ordering::Relaxed) + 1;
+            let area = regions.area_of(k);
+            for (&section, &kind) in &area {
+                shared.map.claim(id, section, kind);
+            }
+            w.regions.area = area;
+            w.regions.topology_seen = None;
+            w.regions.link = Some(RegionLink {
+                shared: Arc::clone(&shared),
+                id,
+                spares: Arc::clone(&self.regions.spares),
+                ids: Arc::clone(&self.regions.ids),
+                pool: Arc::clone(&pool),
+            });
+            lent.extend(chunks.iter().map(|c| (c.x, c.z)));
+            let mut slot = Slot::new(w, id);
             slot.conns = conns;
             slot.fresh = true;
-            // Each region comes home at its own tick of the period.
-            slot.age = (set.games.len() as u32 * resident_period()) / regions_count as u32;
             set.games.push(slot);
-            set.chunks.push(chunks);
         }
-        set.lent = Arc::new(set.chunks.iter().flatten().map(|c| (c.x, c.z)).collect());
+        set.lent = Arc::new(lent);
+        for slot in &mut set.games {
+            slot.owed = slot.game.as_deref().is_some_and(|w| terrain_owed(w, &set.lent));
+            slot.terrain_wait = TERRAIN_GAP;
+        }
         self.lan = Some(host);
         self.regions.prof.note_resident();
         self.regions.prof.add(Step::Split, entered);
@@ -1055,23 +1255,32 @@ impl Game<'_> {
     /// they are back (the tick ran by landing them).
     fn resident_launch(&mut self, mut set: ResidentSet, first: bool) -> Option<Flight> {
         if !first {
-            // The regions that came home alone last tick are lent again.
+            // The regions that came home alone last tick are lent again, or let go when no player is left in them.
             let relending = std::time::Instant::now();
             let mut relent = false;
-            for k in 0..set.games.len() {
+            let mut k = 0;
+            while k < set.games.len() {
                 if set.games[k].landed {
-                    self.relend_slot(&mut set, k);
                     relent = true;
+                    if !self.relend_slot(&mut set, k) {
+                        continue;
+                    }
                 }
+                set.games[k].terrain_wait = set.games[k].terrain_wait.saturating_sub(1);
+                k += 1;
             }
             if relent {
                 self.regions.prof.add(Step::Split, relending);
+            }
+            if set.games.is_empty() {
+                // The last region had no player left.
+                self.land_resident_set(set);
+                return None;
             }
             self.route_region_chat(Some(&mut set));
             match self.residents_must_land(&set) {
                 Some(Land::All(why)) => {
                     self.regions.prof.landed_because(why);
-                    self.regions.resplit = matches!(why, "age" | "left section");
                     let landing = std::time::Instant::now();
                     horizon_client::spans::time("regions_land", || self.land_resident_set(set));
                     self.regions.prof.add(Step::Land, landing);
@@ -1091,7 +1300,13 @@ impl Game<'_> {
                 }
                 None => {}
             }
+            // Regions within the merge radius of each other pause at this tick boundary, and one absorbs the other.
+            let merging = std::time::Instant::now();
+            if self.merge_regions(&mut set) {
+                self.regions.prof.add(Step::Split, merging);
+            }
         }
+        self.stock_spares();
         self.streaming.lent = Some(Arc::clone(&set.lent));
         self.deliver_away_out_home();
         let pool = Arc::clone(
@@ -1193,11 +1408,20 @@ impl Game<'_> {
                     return;
                 };
                 let began = std::time::Instant::now();
+                let mut report = Report::default();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    w.tick_region_phases().map_err(|e| e.to_string())
+                    w.tick_region_phases().map_err(|e| e.to_string())?;
+                    // The end of its own tick: the sections it needs, a split, a merge to ask for.
+                    report = w.region_topology();
+                    Ok(())
                 }))
                 .unwrap_or_else(|_| Err("a region thread panicked".to_owned()));
-                let _ = tx.send((w, result, began.elapsed().as_secs_f32() * 1000.0));
+                let _ = tx.send(Done {
+                    game: w,
+                    result,
+                    took: began.elapsed().as_secs_f32() * 1000.0,
+                    report,
+                });
             });
             self.regions.prof.add(Step::Spawn, spawning);
             if !spawned {
@@ -1211,10 +1435,8 @@ impl Game<'_> {
                 launched.push(k);
             }
         }
-        set.age += 1;
-        for slot in set.games.iter_mut().filter(|s| !s.landed) {
-            slot.age += 1;
-        }
+        // The regions a late region split off before it came home.
+        set.take_in_born();
         // A night skip's wake-up request went into every region that started; one set after this point (by the
         // sleep tick that follows an early launch) stays for the next launch. A region still running keeps it
         // for its next start too.
@@ -1306,6 +1528,7 @@ impl Game<'_> {
             }
         });
         self.regions.prof.add(Step::Wait, waiting);
+        set.take_in_born();
         self.route_region_chat(Some(&mut set));
         super::health::record_regions(
             self.dim.id(),
@@ -1388,15 +1611,12 @@ impl Game<'_> {
         Ok(Some(set))
     }
 
-    /// Whether resident regions have to come back before the next tick: all of them, or only some.
+    /// Whether resident regions have to come back before the next tick: all of them, or only some. No timer is
+    /// among the reasons: a region comes home because the server's thread has something to do with it.
     fn residents_must_land(&self, set: &ResidentSet) -> Option<Land> {
         let Some(host) = self.lan.as_ref() else {
             return Some(Land::All("no host"));
         };
-        // The whole set is split anew now and then: the layout follows the players and the ticking chunks.
-        if set.age >= resident_period() * RESIDENT_REFRESH {
-            return Some(Land::All("age"));
-        }
         let slot_of = |conn: u32| set.games.iter().position(|s| s.conns.contains(&conn));
         let mut slots: Vec<(usize, &'static str)> = Vec::new();
         let mut add = |k: usize, why: &'static str| {
@@ -1435,7 +1655,6 @@ impl Game<'_> {
         if !self.level_teleports.is_empty() {
             return Some(Land::All("teleport"));
         }
-        let reach = host.hub.config.view_distance.clamp(2, 32) + 1;
         for (k, s) in set.games.iter().enumerate() {
             if s.landed {
                 continue;
@@ -1443,25 +1662,36 @@ impl Game<'_> {
             let Some(w) = s.game.as_ref() else {
                 continue;
             };
-            let left = w.lan.as_ref().is_none_or(|h| {
-                h.hub.guests.iter().any(|g| {
-                    let (cx, cz) = g.chunk();
-                    ((cx - reach) >> SECTION_SHIFT..=(cx + reach) >> SECTION_SHIFT).any(|sx| {
-                        ((cz - reach) >> SECTION_SHIFT..=(cz + reach) >> SECTION_SHIFT)
-                            .any(|sz| set.layout.owned.get(&(sx, sz)) != Some(&k))
-                    })
-                })
-            });
-            if left {
-                return Some(Land::All("left section"));
-            }
             if wants_land(w) {
                 add(k, "region wants");
-            } else if s.age >= resident_period() {
-                add(k, "region age");
+            } else if let Some(why) = s.wants {
+                // Its own thread found its area changed, or no player left in it.
+                add(k, why);
+            } else if s.owed && s.terrain_wait == 0 && self.terrain_arrived(w) {
+                add(k, "terrain");
             }
         }
         (!slots.is_empty()).then_some(Land::Slots(slots))
+    }
+
+    /// Whether the server's game holds finished chunks in the views of region game `w`'s players: terrain that
+    /// was not ready when the region was lent, and is now.
+    fn terrain_arrived(&self, w: &Game<'_>) -> bool {
+        let Some(h) = w.lan.as_ref() else {
+            return false;
+        };
+        let view = h.hub.config.view_distance.clamp(2, 32);
+        h.hub.guests.iter().filter(|g| h.hub.here(g)).any(|g| {
+            let (cx, cz) = g.chunk();
+            (cx - view..=cx + view).any(|x| {
+                (cz - view..=cz + view).any(|z| {
+                    self.world
+                        .chunks
+                        .get(&(x, z))
+                        .is_some_and(|c| c.lit && c.postprocess.is_empty())
+                })
+            })
+        })
     }
 
     /// Region `k` alone back in the server's level: it ticks there with the server's thread this tick, and is
@@ -1469,6 +1699,8 @@ impl Game<'_> {
     fn land_slot(&mut self, set: &mut ResidentSet, k: usize) {
         let slot = &mut set.games[k];
         let _ = slot.home(None);
+        set.take_in_born();
+        let slot = &mut set.games[k];
         let Some(mut w) = slot.game.take() else {
             return;
         };
@@ -1478,7 +1710,8 @@ impl Game<'_> {
                 shell.hub.deliver_chat(&line);
             }
         }
-        let drawn = self.take_region_back(&mut w, &set.chunks[k]);
+        let chunks = chunks_of(&w);
+        let drawn = self.take_region_back(&mut w, &chunks);
         self.rand_sequences.absorb(drawn);
         if let (Some(host), Some(shell)) = (host.as_mut(), w.lan.as_mut()) {
             host.hub.park_tracker(&mut shell.hub);
@@ -1492,37 +1725,39 @@ impl Game<'_> {
         }
         slot.game = Some(w);
         slot.landed = true;
+        slot.wants = None;
         self.lan = host;
         self.bind_lan_residents();
         // The set of lent chunks loses this region's, in place (the streamer's copy is let go first).
         self.streaming.lent = None;
         let lent = Arc::make_mut(&mut set.lent);
-        for c in &set.chunks[k] {
+        for c in &chunks {
             lent.remove(&(c.x, c.z));
         }
         self.streaming.lent = Some(Arc::clone(&set.lent));
     }
 
-    /// Region `k`, landed alone, split out of the level again in the layout the set has: its chunks (the ones
-    /// loaded since too), its entities and its players, moved back into its game.
-    fn relend_slot(&mut self, set: &mut ResidentSet, k: usize) {
+    /// Region `k`, landed alone, split out of the level again in the area it owns: its chunks (the ones loaded
+    /// since too), its entities and its players, moved back into its game. False when no player of the server's
+    /// is left in its area: the region is let go (its sections are free, its game spare).
+    fn relend_slot(&mut self, set: &mut ResidentSet, k: usize) -> bool {
         let dim = self.dim;
         let Some(mut w) = set.games[k].game.take() else {
-            return;
+            return true;
         };
         let Some(mut host) = self.lan.take() else {
             set.games[k].game = Some(w);
-            return;
+            return true;
         };
         let pool = Arc::clone(
             self.regions
                 .entity_pool
                 .get_or_insert_with(|| Arc::new(AtomicU32::new(self.next_entity + 1))),
         );
-        // The split is restricted to region `k`, which is then part 0 of 1: it costs what the region holds, not
+        // The split reads this region's sections alone, as part 0 of 1: it costs what the region holds, not
         // what the other regions or the level's count of regions add.
-        let layout = Arc::clone(&set.layout);
-        layout.restrict(Some(k));
+        let id = set.games[k].uid;
+        let layout = Regions::for_area(&w.regions.area, id as usize);
         let in_region: HashMap<u32, usize> = host
             .hub
             .guests
@@ -1530,6 +1765,14 @@ impl Game<'_> {
             .filter(|g| host.hub.here(g))
             .filter_map(|g| Some((g.conn, layout.of_chunk(g.chunk())?)))
             .collect();
+        if in_region.is_empty() {
+            // Nobody is in it any more.
+            self.lan = Some(host);
+            set.shared.map.release_all(id);
+            self.regions.spares.give(w);
+            set.games.remove(k);
+            return false;
+        }
         let guests = host
             .hub
             .split_guests(1, |conn| in_region.get(&conn).copied())
@@ -1541,8 +1784,7 @@ impl Game<'_> {
             .lend_trackers(1, |chunk| layout.of_chunk(chunk))
             .into_iter()
             .next();
-        let split = self.split_level(&layout);
-        layout.restrict(None);
+        let split = self.split_level(&layout, true);
         let part = split
             .parts
             .into_iter()
@@ -1564,17 +1806,20 @@ impl Game<'_> {
         w.lan = Some(shell);
         w.bind_lan_residents();
         self.lan = Some(host);
+        self.streaming.lent = None;
+        let lent = Arc::make_mut(&mut set.lent);
+        lent.extend(chunks.iter().map(|c| (c.x, c.z)));
+        // What the region could not be lent yet is still owed to it.
+        let owed = terrain_owed(&w, lent);
         let slot = &mut set.games[k];
         slot.game = Some(w);
         slot.landed = false;
         slot.fresh = true;
         slot.conns = conns;
-        slot.age = 0;
-        self.streaming.lent = None;
-        let lent = Arc::make_mut(&mut set.lent);
-        lent.extend(chunks.iter().map(|c| (c.x, c.z)));
-        set.chunks[k] = chunks;
+        slot.owed = owed;
+        slot.terrain_wait = TERRAIN_GAP;
         self.streaming.lent = Some(Arc::clone(&set.lent));
+        true
     }
 
     /// The resident regions of the level in place back: their parts of the level and their players.
@@ -1582,16 +1827,19 @@ impl Game<'_> {
         let dim = self.dim;
         self.route_region_chat(Some(&mut set));
         self.streaming.lent = None;
+        // One still ticking is waited for, and the regions it split off are among the set.
+        for slot in &mut set.games {
+            let _ = slot.home(None);
+        }
+        set.take_in_born();
         let mut host = self.lan.take();
         let mut back = Vec::with_capacity(set.games.len());
         let mut lost = false;
         // Whose packets were held for this set's regions: only theirs are released below. Another level's resident
         // regions keep theirs away.
         let mut conns: Vec<u32> = Vec::new();
-        for (mut slot, chunks) in set.games.into_iter().zip(set.chunks) {
+        for mut slot in set.games {
             conns.extend(slot.conns.iter().copied());
-            // One still ticking is waited for.
-            let _ = slot.home(None);
             let Some(mut w) = slot.game.take() else {
                 lost = true;
                 continue;
@@ -1606,6 +1854,7 @@ impl Game<'_> {
                     shell.hub.deliver_chat(&line);
                 }
             }
+            let chunks = chunks_of(&w);
             let drawn = self.take_region_back(&mut w, &chunks);
             self.rand_sequences.absorb(drawn);
             if let (Some(host), Some(shell)) = (host.as_mut(), w.lan.as_mut()) {
@@ -1627,7 +1876,9 @@ impl Game<'_> {
         }
         self.lan = host;
         self.bind_lan_residents();
-        self.regions.idle.entry(dim).or_default().extend(back);
+        for w in back {
+            self.regions.spares.give(w);
+        }
         if !lost {
             self.trim_entity_ids();
         }
@@ -1658,11 +1909,13 @@ impl Game<'_> {
         let Some(pool) = self.regions.entity_pool.clone() else {
             return;
         };
+        let spares = Arc::clone(&self.regions.spares);
+        let mut spare_games = spares.lock();
         let mut high = self.next_entity;
-        for game in self.regions.idle.values().flatten() {
+        for game in spare_games.iter() {
             high = high.max(game.next_entity);
         }
-        for game in self.regions.idle.values_mut().flatten() {
+        for game in spare_games.iter_mut() {
             game.next_entity = 0;
             game.regions.entity_id_end = 0;
         }
@@ -1670,9 +1923,10 @@ impl Game<'_> {
         // Nothing alive holds an id above `high`; what is remembered there is a dead entity's, and the
         // ids are handed out again from the pool.
         self.forget_ids_from(high.saturating_add(1));
-        for game in self.regions.idle.values_mut().flatten() {
+        for game in spare_games.iter_mut() {
             game.forget_ids_from(high.saturating_add(1));
         }
+        drop(spare_games);
         // The server's own block ends where it stands, and takes a fresh one from the wound-back pool at once:
         // whatever the server spawns before its next tick (a summon, a chunk's mobs) must not take ids the
         // pool hands out again to regions or to its own next refill.
@@ -1937,7 +2191,337 @@ impl Game<'_> {
     }
 }
 
-/// `v`'s items whose place a region owns, moved into that region's list; the rest stay.
+impl Game<'_> {
+    /// The end of a region game's own tick: the sections its players and ticking chunks need now, worked out on
+    /// its own thread against the level's [`SectionMap`] that every region reads.
+    ///
+    /// - A region whose sections fall into separate groups splits itself: each group but the one with most
+    ///   players is handed to a spare game ([`Game::carve_into`]). A game for it may be missing; the region
+    ///   then tries again at the end of its next tick.
+    /// - Sections it needs and no region owns are claimed; a section another region owns, or one within the merge
+    ///   radius of another region's, asks for a merge with that region, done at the next tick boundary
+    ///   ([`Game::merge_regions`]).
+    /// - Sections it no longer needs are given up once enough pile up ([`SHRINK_SLACK`]).
+    ///
+    /// The chunks of an area that grew are in the server's game: the region is asked home alone
+    /// ([`Report::wants`]) and lent again with them.
+    fn region_topology(&mut self) -> Report {
+        let mut report = Report::default();
+        let Some(link) = self.regions.link.clone() else {
+            return report;
+        };
+        let Some(host) = self.lan.as_ref() else {
+            return report;
+        };
+        let view = host.hub.config.view_distance.clamp(2, 32) + 1;
+        let players: Vec<(i32, i32)> = host
+            .hub
+            .guests
+            .iter()
+            .filter(|g| host.hub.here(g))
+            .map(|g| g.chunk())
+            .collect();
+        if players.is_empty() {
+            // Nobody left in it (a leave, a death, a player sent away): the server's thread lets it go.
+            report.wants = Some("empty");
+            return report;
+        }
+        // Nothing to work out while no player has moved to another chunk and the chunks that tick are the
+        // same: the common tick costs a pass over the chunks.
+        let levels = self.tickets.levels();
+        let mix = |a: i32, b: i32| {
+            (a as u32 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ (b as u32 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+        };
+        let mut seen = u64::from(view as u32);
+        for &(x, z) in &players {
+            seen = seen.wrapping_add(mix(x, z).rotate_left(11));
+        }
+        let ticking = self
+            .world
+            .chunks
+            .keys()
+            .copied()
+            .filter(|&(x, z)| levels.block_ticking(x, z));
+        let mut count = 0u64;
+        for (x, z) in ticking.clone() {
+            seen = seen.wrapping_add(mix(x >> SECTION_SHIFT, z >> SECTION_SHIFT));
+            count += 1;
+        }
+        seen = seen.wrapping_add(count.rotate_left(32));
+        if self.regions.topology_seen == Some(seen) {
+            return report;
+        }
+        let cut = Regions::new(ticking, &players, view);
+        let mut players_in = vec![0usize; cut.count];
+        for &p in &players {
+            if let Some(r) = cut.of_chunk(p) {
+                players_in[r] += 1;
+            }
+        }
+        let keep = (0..cut.count)
+            .max_by_key(|&g| (players_in[g], std::cmp::Reverse(g)))
+            .unwrap_or(0);
+        let mut carved_all = true;
+        for g in (0..cut.count).filter(|&g| g != keep) {
+            let Some(dest) = link.spares.take() else {
+                carved_all = false;
+                break;
+            };
+            match self.carve_into(dest, cut.area_of(g), &link) {
+                Ok(born) => report.born.push(born),
+                Err(dest) => {
+                    link.spares.give(dest);
+                    carved_all = false;
+                    break;
+                }
+            }
+        }
+        if !report.born.is_empty() {
+            report.conns = self
+                .lan
+                .as_ref()
+                .map(|h| h.hub.guests.iter().map(|g| g.conn).collect());
+        }
+        if !carved_all {
+            // Tried again at the end of the next tick, with the games the server's thread makes meanwhile.
+            return report;
+        }
+        self.regions.topology_seen = Some(seen);
+        let desired = cut.area_of(keep);
+        // What it needs and does not own yet: claimed now, or a merge with whoever owns it.
+        let mut grew = false;
+        let mut owners: FxHashSet<RegionId> = FxHashSet::default();
+        for (&section, &kind) in &desired {
+            if self.regions.area.get(&section).is_some_and(|&have| have >= kind) {
+                continue;
+            }
+            match link.shared.map.claim(link.id, section, kind) {
+                Claim::Held => {
+                    grew |= !self.regions.area.contains_key(&section);
+                    let have = self.regions.area.entry(section).or_insert(kind);
+                    *have = (*have).max(kind);
+                }
+                Claim::Taken(o) => {
+                    owners.insert(o.id);
+                }
+            }
+        }
+        // What it holds and no longer needs, once it is a lot.
+        let stale: Vec<_> = self
+            .regions
+            .area
+            .keys()
+            .filter(|s| !desired.contains_key(s))
+            .copied()
+            .collect();
+        let shrinks = stale.len() >= SHRINK_SLACK;
+        if shrinks {
+            for section in stale {
+                link.shared.map.release(link.id, section);
+                self.regions.area.remove(&section);
+            }
+        }
+        // A player standing in a chunk another region owns: they ran into its area before this check could run.
+        for &p in players.iter().filter(|&&p| cut.of_chunk(p) == Some(keep)) {
+            if let Some(o) = link.shared.map.owner_of_chunk(p)
+                && o.id != link.id
+            {
+                owners.insert(o.id);
+            }
+        }
+        // Claimed first and read after, so of two regions that grow towards each other at once, at least one
+        // sees the other.
+        owners.extend(link.shared.map.neighbours(link.id, &self.regions.area));
+        for other in owners {
+            link.shared.ask_merge(link.id, other);
+        }
+        if grew || shrinks {
+            report.wants = Some("area");
+        }
+        report
+    }
+
+    /// Splits region `area` off this region game into `dest`, a spare game: the area's chunks, entities, block
+    /// ticks and players, with the sections handed over in the map. The existing lend primitives do it, with this
+    /// game as the one that lends. The game back, when nobody can be lent to it.
+    fn carve_into(
+        &mut self,
+        mut dest: Box<Game<'static>>,
+        area: Area,
+        link: &RegionLink,
+    ) -> std::result::Result<Born, Box<Game<'static>>> {
+        let Some(mut host) = self.lan.take() else {
+            return Err(dest);
+        };
+        let id = link.ids.fetch_add(1, Ordering::Relaxed) + 1;
+        let dim = self.dim;
+        let layout = Regions::for_area(&area, (id as usize) << 20);
+        let conns: Vec<u32> = host
+            .hub
+            .guests
+            .iter()
+            .filter(|g| host.hub.here(g) && layout.of_chunk(g.chunk()).is_some())
+            .map(|g| g.conn)
+            .collect();
+        let guests = host.hub.hand_guests(&conns);
+        let tracker = host
+            .hub
+            .lend_trackers(1, |chunk| layout.of_chunk(chunk))
+            .into_iter()
+            .next();
+        // Every chunk of the area goes: a region game's chunks are all finished.
+        let split = self.split_level(&layout, false);
+        let part = split
+            .parts
+            .into_iter()
+            .next()
+            .expect("a part for the region");
+        let mob_ids: Vec<u32> = part.mobs.iter().map(|m| m.id).collect();
+        self.lend_region(&mut dest, part);
+        dest.copy_world_settings_from(self);
+        dest.refill_entity_ids(&link.pool);
+        self.lend_maps(&mut dest);
+        let mut shell = dest.lan.take().unwrap_or_else(|| host.region_shell());
+        host.lend_region(&mut shell, &conns, &mob_ids, dim, guests);
+        if let Some(tracker) = tracker {
+            shell.hub.set_tracker(tracker);
+        }
+        dest.lan = Some(shell);
+        self.lan = Some(host);
+        dest.bind_lan_residents();
+        self.bind_lan_residents();
+        for (&section, &kind) in &area {
+            if !link.shared.map.hand(link.id, id, section, kind) {
+                link.shared.map.claim(id, section, kind);
+            }
+            self.regions.area.remove(&section);
+        }
+        dest.regions.area = area;
+        dest.regions.topology_seen = None;
+        dest.regions.link = Some(RegionLink {
+            id,
+            ..link.clone()
+        });
+        Ok(Born {
+            game: dest,
+            id,
+            conns,
+        })
+    }
+
+    /// Region game `b`, merged into this one: everything it holds (its part of the level, its entities, its
+    /// players and what is kept for them) and its sections. The existing take-back primitive does it, with this
+    /// game as the one that takes: nothing passes through the server's game.
+    fn absorb_region(&mut self, b: &mut Game<'_>) {
+        let chunks = chunks_of(b);
+        let drawn = self.take_region_back(b, &chunks);
+        self.rand_sequences.absorb(drawn);
+        if let (Some(host), Some(shell)) = (self.lan.as_mut(), b.lan.as_mut()) {
+            host.hub.park_tracker(&mut shell.hub);
+            host.take_peer_region(shell);
+        }
+        for (section, kind) in b.regions.area.drain() {
+            let have = self.regions.area.entry(section).or_insert(kind);
+            *have = (*have).max(kind);
+        }
+        self.regions.topology_seen = None;
+        self.bind_lan_residents();
+    }
+
+    /// The regions that asked for a merge ([`Game::region_topology`]), merged where both are at their tick
+    /// boundary: home, not landed, not still ticking. One that is not waits for the next tick. The one with more
+    /// chunks absorbs the other. Whether any merged.
+    fn merge_regions(&mut self, set: &mut ResidentSet) -> bool {
+        let asked: Vec<(RegionId, RegionId)> = set
+            .shared
+            .merges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect();
+        let mut merged = false;
+        for (a, b) in asked {
+            let position = |set: &ResidentSet, id: RegionId| set.games.iter().position(|s| s.uid == id);
+            let forget = |set: &ResidentSet| {
+                set.shared
+                    .merges
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&(a, b));
+            };
+            let (Some(ia), Some(ib)) = (position(set, a), position(set, b)) else {
+                // One of them is gone (merged into another, or let go): the next area check asks again if need be.
+                forget(set);
+                continue;
+            };
+            let now = std::time::Instant::now();
+            for i in [ia, ib] {
+                let _ = set.games[i].home(Some(now));
+            }
+            set.take_in_born();
+            let ready = |s: &Slot| s.running.is_none() && !s.landed && s.game.is_some();
+            if !(ready(&set.games[ia]) && ready(&set.games[ib])) {
+                continue;
+            }
+            forget(set);
+            let (keep, gone) = if set.games[ia].chunks >= set.games[ib].chunks {
+                (ia, ib)
+            } else {
+                (ib, ia)
+            };
+            let mut gone_slot = set.games.remove(gone);
+            let keep = if gone < keep { keep - 1 } else { keep };
+            let slot = &mut set.games[keep];
+            let (Some(mut big), Some(mut small)) = (slot.game.take(), gone_slot.game.take()) else {
+                continue;
+            };
+            big.absorb_region(&mut small);
+            set.shared.map.reassign(gone_slot.uid, slot.uid);
+            slot.conns.append(&mut gone_slot.conns);
+            slot.mail.append(&mut gone_slot.mail);
+            slot.players.append(&mut gone_slot.players);
+            slot.places.append(&mut gone_slot.places);
+            slot.sleep = (
+                slot.sleep.0 + gone_slot.sleep.0,
+                slot.sleep.1 + gone_slot.sleep.1,
+                slot.sleep.2 + gone_slot.sleep.2,
+            );
+            slot.chunks += gone_slot.chunks;
+            slot.owed |= gone_slot.owed;
+            slot.wants = slot.wants.or(gone_slot.wants);
+            slot.game = Some(big);
+            self.regions.spares.give(small);
+            merged = true;
+        }
+        merged
+    }
+}
+
+/// The chunks region game `w` holds.
+fn chunks_of(w: &Game<'_>) -> Vec<ChunkPos> {
+    w.world
+        .chunks
+        .keys()
+        .map(|&(x, z)| ChunkPos::new(x, z))
+        .collect()
+}
+
+/// Whether a chunk in the view of one of region game `w`'s players is not among the chunks `lent` to the
+/// regions: not loaded yet, or not finished, so the server's game still holds it.
+fn terrain_owed(w: &Game<'_>, lent: &FxHashSet<(i32, i32)>) -> bool {
+    let Some(h) = w.lan.as_ref() else {
+        return false;
+    };
+    let view = h.hub.config.view_distance.clamp(2, 32);
+    h.hub.guests.iter().filter(|g| h.hub.here(g)).any(|g| {
+        let (cx, cz) = g.chunk();
+        (cx - view..=cx + view)
+            .any(|x| (cz - view..=cz + view).any(|z| !lent.contains(&(x, z))))
+    })
+}
+
 /// Takes a landed region's reported sleep counts out of the total the server's hub keeps for the regions away.
 fn take_sleep(total: &mut (i64, i64, i64), region: (i64, i64, i64)) {
     total.0 = (total.0 - region.0).max(0);
@@ -2123,12 +2707,16 @@ impl Game<'_> {
     /// The level in place split into `layout`'s parts: each region's chunks, block entities, ticks and
     /// entities moved out of this game's level; what no region owns stays, and so do the chunks the streaming has
     /// not finished, with what is in them ([`Lending`]).
-    pub(super) fn split_level(&mut self, layout: &Regions) -> LevelSplit {
+    ///
+    /// `hold_unfinished`: the streaming of this game's level has chunks it has not finished (the server's game).
+    /// A region game's chunks are all finished: a part split out of one moves every chunk it owns.
+    pub(super) fn split_level(&mut self, layout: &Regions, hold_unfinished: bool) -> LevelSplit {
         // A split restricted to one region reads the chunks of its sections alone, not the level's every chunk: the
         // cost of a relend follows the region, not the level.
         let scope: Option<Vec<(i32, i32)>> = layout.only_region().map(|k| layout.chunk_keys(k));
         let unfinished = |c: &horizon_client::chunk::Chunk| !c.lit || !c.postprocess.is_empty();
         let held: FxHashSet<(i32, i32)> = match &scope {
+            _ if !hold_unfinished => FxHashSet::default(),
             Some(keys) => keys
                 .iter()
                 .filter(|key| self.world.chunks.get(key).is_some_and(|c| unfinished(c)))
@@ -2147,7 +2735,7 @@ impl Game<'_> {
             held: &held,
         };
         let n = regions.parts();
-        let first = regions.only_region().unwrap_or(0);
+        let first = layout.band + regions.only_region().unwrap_or(0);
         let of_chunk = |key: (i32, i32)| regions.of_chunk(key);
         // Entities read from chunk files still wait in the world: they join the level first (the step a tick
         // takes), or they would be added to chunks this game no longer holds once those went to a region.
@@ -2415,5 +3003,208 @@ mod tests {
         assert_eq!(lent, [1]);
         let kept: Vec<u32> = mobs.iter().map(|m| m.id).collect();
         assert_eq!(kept, [3]);
+    }
+
+    #[test]
+    fn a_regions_area_says_which_sections_tick_which_are_view_and_which_are_ring() {
+        // One player with a view of 8 chunks: the ticking section under them and the view sections around it.
+        let r = Regions::new([(0, 0)], &[(0, 0)], 8);
+        let area = r.area_of(0);
+        assert_eq!(area.get(&(0, 0)), Some(&Kind::Ticking));
+        assert_eq!(area.get(&(2, 2)), Some(&Kind::View));
+        assert_eq!(area.get(&(1, 0)), Some(&Kind::View));
+        // With no view of their own, the ticking section is owned with the ring of one section around it.
+        let r = Regions::new([(0, 0)], &[(0, 0)], 0);
+        let area = r.area_of(0);
+        assert_eq!(area.len(), 9);
+        assert_eq!(area.values().filter(|&&k| k == Kind::Ticking).count(), 1);
+        assert_eq!(area.values().filter(|&&k| k == Kind::Ring).count(), 8);
+    }
+
+    #[test]
+    fn players_who_walk_apart_are_separate_groups_and_the_region_keeps_the_one_it_chooses() {
+        // The same ticking chunks and two players: together while they stand 6 chunks apart, two groups at 40.
+        let together = Regions::new([(0, 0), (6, 0)], &[(0, 0), (6, 0)], 3);
+        assert_eq!(together.count, 1);
+        let apart = Regions::new([(0, 0), (40, 0)], &[(0, 0), (40, 0)], 3);
+        assert_eq!(apart.count, 2);
+        // Each group's area is disjoint from the other's: what a split hands over is exactly one group's.
+        let (a, b) = (apart.area_of(0), apart.area_of(1));
+        assert!(a.keys().all(|s| !b.contains_key(s)));
+        // A region carved out of another owns exactly the area it was given, as one region.
+        let carved = Regions::for_area(&b, 9 << 20);
+        assert_eq!(carved.parts(), 1);
+        assert_eq!(carved.of_chunk((40, 0)), Some(0));
+        assert_eq!(carved.of_chunk((0, 0)), None);
+        assert_eq!(carved.chunk_keys(0).len(), b.len() * 16);
+    }
+
+    /// A region game holding two players far apart, each with chunks around them, a cow and an item, claiming
+    /// the union of their areas as one region: what a region looks like when its players have walked apart.
+    /// `test` gets that game and a spare game to split into.
+    fn region_of_two_far_players(
+        test: impl FnOnce(&mut Game<'_>, Box<Game<'static>>, Arc<SetShared>, Arc<Spares>),
+    ) {
+        use horizon_core::geometry::Vec3;
+        crate::game::native_guest_turn_tests::with_guests(|game| {
+            let far = 4800.0;
+            game.lan
+                .as_mut()
+                .unwrap()
+                .hub
+                .update_guest(13, |g| {
+                    g.position = [far, 64.0, 5.0];
+                    g.health = 7.5;
+                })
+                .unwrap();
+            for (cx, cz) in [(0, 0), (300, 0)] {
+                for dx in -1..=1 {
+                    for dz in -1..=1 {
+                        game.world.chunks.insert(
+                            (cx + dx, cz + dz),
+                            Arc::new(horizon_client::chunk::Chunk::empty(cx + dx, cz + dz)),
+                        );
+                    }
+                }
+            }
+            let cow = game.res.mob_types().get("minecraft:cow").unwrap().clone();
+            let mut near = Mob::new(101, cow.clone(), Vec3::new(3.5, 64.0, 5.5), 0.0);
+            near.health = 4.0;
+            let mut away = Mob::new(202, cow, Vec3::new(far + 0.5, 64.0, 5.5), 0.0);
+            away.health = 3.0;
+            game.mobs.push(near);
+            game.mobs.push(away);
+            game.persist.uuids.insert(202, [1, 2, 3, 4]);
+            // The spare a region splits into: made as the server's thread makes them.
+            let res = game.static_resources();
+            let spare = Box::new(
+                super::super::integrated::server_game(
+                    res,
+                    game.pack.clone(),
+                    game.options.clone(),
+                    game.settings.clone(),
+                )
+                .unwrap(),
+            );
+            // The players' areas as one region claimed them.
+            let ticking: Vec<(i32, i32)> = game.world.chunks.keys().copied().collect();
+            let cut = Regions::new(
+                ticking,
+                &[(0, 0), (300, 0)],
+                game.lan.as_ref().unwrap().hub.config.view_distance + 1,
+            );
+            assert_eq!(cut.count, 2);
+            let shared = Arc::new(SetShared::default());
+            let spares = Arc::new(Spares::default());
+            let mut area = cut.area_of(0);
+            area.extend(cut.area_of(1));
+            for (&section, &kind) in &area {
+                assert_eq!(shared.map.claim(7, section, kind), Claim::Held);
+            }
+            game.regions.area = area;
+            game.regions.worker = true;
+            game.regions.link = Some(RegionLink {
+                shared: Arc::clone(&shared),
+                id: 7,
+                spares: Arc::clone(&spares),
+                ids: Arc::new(AtomicU64::new(7)),
+                pool: Arc::new(AtomicU32::new(1_000_000)),
+            });
+            test(game, spare, shared, spares);
+        });
+    }
+
+    fn mob_ids(game: &Game<'_>) -> Vec<u32> {
+        let mut ids: Vec<u32> = game.mobs.iter().map(|m| m.id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn guest_conns(game: &Game<'_>) -> Vec<u32> {
+        let mut conns: Vec<u32> = game
+            .lan
+            .as_ref()
+            .map_or(Vec::new(), |h| h.hub.guests.iter().map(|g| g.conn).collect());
+        conns.sort_unstable();
+        conns
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn a_region_whose_players_walked_apart_splits_itself_and_each_part_keeps_its_state() {
+        region_of_two_far_players(|a, spare, shared, spares| {
+            spares.give(spare);
+            let report = a.region_topology();
+            assert_eq!(report.born.len(), 1, "one new region for the far player");
+            let mut born = report.born.into_iter().next().unwrap();
+            // The player with more... both have one: the first group keeps, the far one is carved out.
+            assert_eq!(born.conns, [13]);
+            assert_eq!(report.conns, Some(vec![12]));
+            let b = &mut born.game;
+            // Entities and players: each in the region that owns their place, with what they held.
+            assert_eq!(mob_ids(a), [101]);
+            assert_eq!(mob_ids(b), [202]);
+            assert_eq!(b.mobs[0].health, 3.0);
+            assert_eq!(b.persist.uuids.get(&202), Some(&[1, 2, 3, 4]));
+            assert_eq!(guest_conns(a), [12]);
+            assert_eq!(guest_conns(b), [13]);
+            let moved = b.lan.as_ref().unwrap().hub.guest(13).unwrap();
+            assert_eq!((moved.health, moved.position[0]), (7.5, 4800.0));
+            // Chunks: the 3 x 3 around each player, none shared.
+            assert_eq!(a.world.chunks.len(), 9);
+            assert_eq!(b.world.chunks.len(), 9);
+            assert!(b.world.chunks.contains_key(&(300, 0)));
+            // The sections: the far ones are the new region's in the map, and the region's own area lost them.
+            let link = a.regions.link.clone().unwrap();
+            assert_eq!(shared.map.owner_of_chunk((300, 0)).map(|o| o.id), Some(born.id));
+            assert_eq!(shared.map.owner_of_chunk((0, 0)).map(|o| o.id), Some(link.id));
+            assert!(a.regions.area.keys().all(|s| shared.map.owner(*s).map(|o| o.id) == Some(link.id)));
+            assert!(b.regions.area.keys().all(|s| shared.map.owner(*s).map(|o| o.id) == Some(born.id)));
+            // Both are regions that stand on their own: nobody asks for anything more.
+            assert!(report.wants.is_none());
+            assert_eq!(*shared.merges.lock().unwrap(), Default::default());
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn a_region_that_finds_no_spare_game_keeps_everything_and_asks_for_one() {
+        region_of_two_far_players(|a, _spare, _shared, spares| {
+            let report = a.region_topology();
+            assert!(report.born.is_empty());
+            assert_eq!(spares.wanted.load(Ordering::Relaxed), 1);
+            // Nothing moved, and the next tick works it out again.
+            assert_eq!(mob_ids(a), [101, 202]);
+            assert_eq!(guest_conns(a), [12, 13]);
+            assert_eq!(a.regions.topology_seen, None);
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn a_region_absorbed_by_another_hands_over_its_entities_players_chunks_and_sections() {
+        region_of_two_far_players(|a, spare, shared, spares| {
+            spares.give(spare);
+            let mut born = a.region_topology().born.into_iter().next().unwrap();
+            let link = a.regions.link.clone().unwrap();
+            let whole = a.regions.area.len() + born.game.regions.area.len();
+            // The region that split off is within the merge radius of the first again: the one asks the other,
+            // and the server's thread merges at the tick boundary (`merge_regions`).
+            shared.map.reassign(born.id, link.id);
+            a.absorb_region(&mut born.game);
+            assert_eq!(mob_ids(a), [101, 202]);
+            assert_eq!(a.mobs.iter().find(|m| m.id == 202).unwrap().health, 3.0);
+            assert_eq!(a.persist.uuids.get(&202), Some(&[1, 2, 3, 4]));
+            assert_eq!(guest_conns(a), [12, 13]);
+            let moved = a.lan.as_ref().unwrap().hub.guest(13).unwrap();
+            assert_eq!((moved.health, moved.position[0]), (7.5, 4800.0));
+            assert_eq!(a.world.chunks.len(), 18);
+            assert_eq!(a.regions.area.len(), whole);
+            // What was absorbed holds nothing any more.
+            assert!(born.game.mobs.is_empty());
+            assert!(born.game.world.chunks.is_empty());
+            assert!(guest_conns(&born.game).is_empty());
+            assert!(born.game.persist.uuids.is_empty());
+        });
     }
 }

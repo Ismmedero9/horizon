@@ -138,7 +138,6 @@ enabled = true               # false pauses it and keeps the webhook
 # [regions]
 # enabled = true
 # deadline_ms = 50           # how long a tick waits for its regions
-# resident_ticks = 20        # ticks a region stays on its thread before it comes home
 "##;
 
 /// Each typed setting: its section, its name, and the vanilla key it writes.
@@ -248,35 +247,32 @@ pub struct Config {
 
 /// `[regions]`: `enabled = true` ticks the world by resident regions on threads of their own (the game's
 /// `game/runtime/regions.rs`): players in separate areas of a level are ticked in parallel. Off by default; with it off the
-/// tick is vanilla's serial one. `deadline_ms` is how long a tick waits for its regions, `resident_ticks` how many
-/// ticks a region stays on its own thread before it comes home. `[engine] parallel_tick` alone never turns it on. The
+/// tick is vanilla's serial one. `deadline_ms` is how long a tick waits for its regions. A region stays on its own
+/// thread and splits and merges by itself: `resident_ticks`, the ticks before it came home, is gone, and a file that
+/// still has it loads and ignores it. `[engine] parallel_tick` alone never turns it on. The
 /// environment variables `HORIZON_REGIONS=0`, `HORIZON_PARALLEL_TICK=0` and `HORIZON_REGION_THREADS=0` still override it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Regions {
     pub enabled: bool,
     pub deadline_ms: u32,
-    pub resident_ticks: u32,
+    /// Removed: read so an older `server.toml` still loads, never used or written.
+    #[serde(skip_serializing)]
+    pub resident_ticks: Option<u32>,
 }
 impl Default for Regions {
     fn default() -> Self {
-        // The defaults match `region_deadline` and `resident_period` in horizon-client's game/runtime/regions.rs.
+        // The default matches `region_deadline` in horizon-client's game/runtime/regions.rs.
         Self {
             enabled: false,
             deadline_ms: 50,
-            resident_ticks: 20,
+            resident_ticks: None,
         }
     }
 }
 impl Regions {
     fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
-    fn check(&self) -> Result<(), String> {
-        if self.resident_ticks == 0 {
-            return Err("regions.resident_ticks must be at least 1".into());
-        }
-        Ok(())
+        self.enabled == Self::default().enabled && self.deadline_ms == Self::default().deadline_ms
     }
 }
 
@@ -861,7 +857,6 @@ impl Config {
                 ));
             }
         }
-        self.regions.check()?;
         if self.server.port == 0 {
             return Err("server.port must be a port number from 1 to 65535".into());
         }

@@ -243,7 +243,7 @@ fn command(
         command.env("HORIZON_PARALLEL_TICK", "1");
     }
     // `[regions] enabled`: region ticking has a switch of its own (`HORIZON_REGIONS`), which `parallel_tick` alone
-    // never turns on. It runs on the parallel tick's helpers, so it turns that on too, and passes its two numbers.
+    // never turns on. It runs on the parallel tick's helpers, so it turns that on too, and passes its deadline.
     // A variable the operator already set wins, so `HORIZON_PARALLEL_TICK=0` or `HORIZON_REGIONS=0` still turn it off.
     if regions.enabled {
         for (name, value) in [
@@ -253,7 +253,6 @@ fn command(
                 "HORIZON_REGION_DEADLINE_MS",
                 regions.deadline_ms.to_string(),
             ),
-            ("HORIZON_RESIDENT_TICKS", regions.resident_ticks.to_string()),
         ] {
             if std::env::var_os(name).is_none() {
                 command.env(name, value);
@@ -463,16 +462,12 @@ mod tests {
                 .find(|(k, _)| *k == name)
                 .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
         };
-        assert_eq!(env(Regions::default(), "HORIZON_RESIDENT_TICKS"), None);
+        assert_eq!(env(Regions::default(), "HORIZON_REGION_DEADLINE_MS"), None);
         let on = Regions {
             enabled: true,
             deadline_ms: 30,
-            resident_ticks: 40,
+            ..Regions::default()
         };
-        assert_eq!(
-            env(on.clone(), "HORIZON_RESIDENT_TICKS").as_deref(),
-            Some("40")
-        );
         assert_eq!(
             env(on.clone(), "HORIZON_REGION_DEADLINE_MS").as_deref(),
             Some("30")

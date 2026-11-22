@@ -408,7 +408,7 @@ def server_command(kind, directory, args):
         # Mob AI far from players (docs/hosting.md): the defaults of Pufferfish's DAB.
         toml.write_text(toml.read_text() + '\n[entities]\ndab = true\n')
     if args.regions:
-        # Region ticking (docs/hosting.md, "Regions"), with its default deadline and resident ticks.
+        # Region ticking (docs/hosting.md, "Regions"), with its default deadline.
         toml.write_text(toml.read_text() + '\n[regions]\nenabled = true\n')
     return [server, '--dir', directory, 'run']
 
@@ -628,6 +628,9 @@ def run_once(kind, bots, behaviour, args, out):
             'join_ms': summary.get('join_time'),
             'bots_failed': [b for b in summary.get('per_bot', []) if b.get('error')],
             'tick_queries': len(ticks),
+            # With --regions: the server's own profile of its region ticking, one line a 200 ticks (landing
+            # ticks, why regions came home, where the tick time goes).
+            **({'regions_profile': [l for l in server.since(0) if 'regions: wait' in l][-6:]} if args.regions else {}),
         })
         if profiling:
             finish_profile(server, directory, result)

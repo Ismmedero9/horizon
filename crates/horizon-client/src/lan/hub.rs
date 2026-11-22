@@ -931,6 +931,37 @@ impl Hub {
         out
     }
 
+    /// The guests on `conns` taken out, to hand to another region's hub: a region splitting one off.
+    pub fn hand_guests(&mut self, conns: &[u32]) -> Vec<Guest> {
+        let mut out = Vec::new();
+        let mut kept = Vec::with_capacity(self.guests.len());
+        for g in self.guests.take_rows() {
+            if conns.contains(&g.conn) {
+                out.push(g);
+            } else {
+                kept.push(g);
+            }
+        }
+        self.guests.extend(kept);
+        out
+    }
+
+    /// A region's hub that is merged into this one: its guests and what its tick left. They were never home,
+    /// so unlike [`Hub::take_guests_back`] nothing of the server's roster changes hands.
+    pub fn take_peer_guests(&mut self, peer: &mut Hub) {
+        self.guests.extend(peer.guests.take_rows());
+        self.native_menu_events.append(&mut peer.native_menu_events);
+        self.native_tracking.append(&mut peer.native_tracking);
+        self.attachment_snapshots
+            .append(&mut peer.attachment_snapshots);
+        self.native_advancement_grants
+            .append(&mut peer.native_advancement_grants);
+        for (k, v) in peer.item_ids.drain() {
+            self.item_ids.entry(k).or_insert(v);
+        }
+        self.restore_guest_order();
+    }
+
     /// The guests in connection order again after regions gave theirs back ([`Hub::take_guests_back`] only
     /// appends).
     pub fn restore_guest_order(&mut self) {
