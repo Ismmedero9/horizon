@@ -813,6 +813,10 @@ impl Game<'_> {
             entity,
         } in items
         {
+            // The lag reducer draws one of several identical items lying together.
+            if entity && self.lag_reducer.hides(item.id) {
+                continue;
+            }
             let entity_start = out.len();
             self.mark_motion(entity_start, (2 << 32) | u64::from(item.id));
             let q = item.position;

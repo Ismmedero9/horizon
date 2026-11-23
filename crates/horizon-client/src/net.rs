@@ -1146,6 +1146,18 @@ fn run(
         .map_err(e)?,
     )
     .map_err(e)?;
+    // The channels voice chat listens on, as Fabric announces its own: a proxy only passes on plugin messages
+    // for channels the client registered.
+    c.send(
+        &cfg::Serverbound::CustomPayload(cfg::CustomPayload {
+            channel: "minecraft:register".into(),
+            // The same names as `horizon_voicechat::groups::ANNOUNCED`.
+            data: b"voicechat:secret\0voicechat:state\0voicechat:states\0voicechat:add_group\0voicechat:remove_group\0voicechat:joined_group\0voicechat:remove_state\0voicechat:update_state\0".to_vec(),
+        })
+        .try_encode()
+        .map_err(e)?,
+    )
+    .map_err(e)?;
     c.send(&cfg::Serverbound::ClientInformation(info).encode())
         .map_err(e)?;
     let (mut reader, writer) = c.split();

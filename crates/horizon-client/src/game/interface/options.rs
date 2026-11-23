@@ -835,12 +835,13 @@ impl Game<'_> {
     }
 }
 
-/// Fullbright is held off on another's server, where it would light what the server shows
-/// dark: a connection without this window's integrated server, as a multiplayer server
-/// or a LAN guest has. Single player, a LAN host and Replay Studio keep it.
+/// Fullbright is no longer held off on another's server (upstream's #3823 held it off on a
+/// multiplayer server or another player's LAN world): the saved choice applies everywhere, so
+/// it does not depend on a night vision effect that a totem of undying clears. Kept as a
+/// function so the graphics screen's row and `hold_fullbright` need no other change.
 /// `connection`: none, or whether it plays on this window's integrated server.
-fn fullbright_held(connection: Option<bool>, studio: bool) -> bool {
-    connection == Some(false) && !studio
+fn fullbright_held(_connection: Option<bool>, _studio: bool) -> bool {
+    false
 }
 
 /// The named device can be a connected pad that has not driven the game yet.
@@ -1014,14 +1015,11 @@ mod fullbright_tests {
     use super::fullbright_held;
 
     #[test]
-    fn fullbright_is_held_only_on_another_servers_world() {
-        // The title screen, with no connection.
+    fn fullbright_is_never_held() {
         assert!(!fullbright_held(None, false));
-        // Single player and a LAN host play their own save; so does a splitscreen seat in P1's.
         assert!(!fullbright_held(Some(true), false));
-        // A multiplayer server, or another player's world opened to LAN.
-        assert!(fullbright_held(Some(false), false));
-        // Replay Studio plays a recording, not a server.
+        // A multiplayer server, or another player's world opened to LAN, keeps it too.
+        assert!(!fullbright_held(Some(false), false));
         assert!(!fullbright_held(Some(false), true));
     }
 }

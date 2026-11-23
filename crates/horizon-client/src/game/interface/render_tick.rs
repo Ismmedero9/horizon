@@ -603,7 +603,9 @@ impl Game<'_> {
         }
         if running {
             self.texture_ticks += 1;
+            self.tick_lag_reducer();
         }
+        self.voicechat_tick();
     }
     /// What `AtmosphericFogEnvironment.updateRainFogState` reads at the eye: the rain, the sky
     /// light and whether the biome has precipitation.

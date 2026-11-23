@@ -1249,6 +1249,8 @@ struct Game<'a> {
     particles: horizon_client::particles::ParticleEngine,
     /// `ItemPickupParticle`s: taken items, orbs and arrows flying to their collector.
     pickups: pickups::Pickups,
+    /// Which dropped items and primed TNT this window leaves out (`lag_reducer`).
+    lag_reducer: lag_reducer::LagReducer,
     /// Sign text being edited (`SignEditScreen`).
     sign_edit: Option<sign_edit::SignEditor>,
     /// An open book, book and quill or lectern screen.
@@ -10842,6 +10844,7 @@ impl<'a> Game<'a> {
             guardian_sounds: HashSet::new(),
             guardian_look_scratch: Vec::new(),
             dropped: Default::default(),
+            lag_reducer: Default::default(),
             next_entity: 0,
             ticked_entities_through: u32::MAX,
             contact_drops: 0..0,

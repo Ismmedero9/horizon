@@ -333,6 +333,63 @@ pub fn scale(
     }
 }
 
+/// BetterF3's look for the F3 text: the version line in sienna, a light blue `label:`, the value
+/// after it in white with its numbers and `true`/`false` coloured, `XYZ` in red / green / blue and
+/// the frame rate green, yellow or red by how fast it is, the footer's hints in pale yellow.
+const F3_VERSION: u32 = 0xA0522D;
+const F3_LABEL: u32 = 0x00AAFF;
+const F3_VALUE: u32 = 0xFFFFFF;
+const F3_HINT: u32 = 0xFDFD96;
+const F3_X: u32 = 0xFF5555;
+const F3_Y: u32 = 0x55FF55;
+const F3_Z: u32 = 0x5555FF;
+const F3_GOOD: u32 = 0x55FF55;
+const F3_OKAY: u32 = 0xFFFF55;
+const F3_BAD: u32 = 0xFF5555;
+
+fn styled_line(line: &str) -> Text {
+    if line.starts_with("Minecraft ") {
+        return Text::colored(line.to_owned(), F3_VERSION);
+    }
+    if line.starts_with("For help") || line.starts_with("Debug charts") || line.starts_with("Debug options") {
+        return Text::colored(line.to_owned(), F3_HINT);
+    }
+    // "123 fps T: 120 vsync ...": the rate by how smooth it is.
+    if let Some((rate, rest)) = line.split_once(" fps") {
+        if let Ok(fps) = rate.trim().parse::<u32>() {
+            let color = if fps >= 60 { F3_GOOD } else if fps >= 30 { F3_OKAY } else { F3_BAD };
+            return Text::colored(rate.to_owned(), color)
+                .append(Text::colored(" fps".to_owned(), F3_LABEL))
+                .append(Text::colored(rest.to_owned(), F3_VALUE));
+        }
+    }
+    let Some((label, value)) = line.split_once(": ") else {
+        return Text::colored(line.to_owned(), F3_VALUE);
+    };
+    // Not a "label: value" pair when the left side is long or is itself a sentence.
+    if label.len() > 28 || label.contains('(') {
+        return Text::colored(line.to_owned(), F3_VALUE);
+    }
+    let head = Text::colored(format!("{label}: "), F3_LABEL);
+    if label == "XYZ" {
+        let parts: Vec<&str> = value.split(" / ").collect();
+        if parts.len() == 3 {
+            return head
+                .append(Text::colored(parts[0].to_owned(), F3_X))
+                .append(Text::colored(" / ".to_owned(), F3_VALUE))
+                .append(Text::colored(parts[1].to_owned(), F3_Y))
+                .append(Text::colored(" / ".to_owned(), F3_VALUE))
+                .append(Text::colored(parts[2].to_owned(), F3_Z));
+        }
+    }
+    let color = match value.trim() {
+        "true" => F3_GOOD,
+        "false" => F3_BAD,
+        _ => F3_VALUE,
+    };
+    head.append(Text::colored(value.to_owned(), color))
+}
+
 /// `extractLines` for both columns under the overlay's pose: each line's
 /// background first, then the text, right-aligned in the right column.
 pub fn draw(font: &Font, columns: [&[String]; 2], scale: f32, width: i32) -> Vec<GuiDraw> {
@@ -359,11 +416,11 @@ pub fn draw(font: &Font, columns: [&[String]; 2], scale: f32, width: i32) -> Vec
         }
         for (line, left, top, _) in placed {
             out.push(GuiDraw::Text {
-                // Entries colour their text with legacy codes.
+                // Entries colour their text with legacy codes; the rest gets BetterF3's look.
                 text: if line.contains('§') {
                     Text::legacy(line)
                 } else {
-                    Text::literal(line.clone())
+                    styled_line(line)
                 },
                 x: left,
                 y: top,

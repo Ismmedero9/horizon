@@ -486,6 +486,10 @@ impl Game<'_> {
             if self.hides_as_camera(t.id) {
                 continue;
             }
+            // The lag reducer thins out a crowd of primed TNT.
+            if self.lag_reducer.hides(t.id) {
+                continue;
+            }
             // EntityRenderer.shouldRender.
             let Some(sight) = self.standing_entity_sight(
                 camera,

@@ -6,6 +6,10 @@ impl Game<'_> {
     pub(super) fn apply_packet_body(&mut self, packet: C) -> Result<()> {
         self.observe_client_packet(&packet);
         match packet {
+            // Simple Voice Chat's plugin messages (the secret, the players' states): the voice chat service's.
+            C::CustomPayload(p) if p.channel.starts_with("voicechat:") => {
+                self.voicechat_payload(&p.channel, &p.data);
+            }
             // ClientCommonPacketListenerImpl.handlePing runs on the game
             // thread, after all preceding packets (especially teleports).
             C::Ping(p) => self.send(S::Pong(p)),

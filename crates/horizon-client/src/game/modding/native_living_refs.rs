@@ -128,11 +128,31 @@ impl Game<'_> {
     /// player, an armor stand or the dragon), or None for another kind or a
     /// stale handle.
     ///
-    /// On a client, only the local player is one: the client keeps the others'
-    /// equipment, effects and health only as far as it draws them. API 382.
+    /// On a client, the local player is one for every read; another tracked mob or player
+    /// answers the health reads only (the client keeps the others' equipment and effects only
+    /// as far as it draws them). API 382.
     pub(super) fn living(&self, entity: EntityRef) -> Option<LivingRef> {
         let living = LivingRef::new(entity);
-        self.native_living_read_target(living).map(|_| living)
+        self.native_living_read_target(living)
+            .or_else(|| self.native_client_remote_mob(living))
+            .map(|_| living)
+    }
+    /// On a client, the copy of a mob or another player the server tracks for this window
+    /// (`ClientLevel`'s entity, here a `self.mobs` entry). Only the health reads accept it: the
+    /// client keeps that much of another entity (`DATA_HEALTH_ID` and its `max_health` attribute),
+    /// so every other living read still answers None for it.
+    fn native_client_remote_mob(&self, living: LivingRef) -> Option<Target> {
+        if self.is_logical_server() {
+            return None;
+        }
+        let remote = self.remote.as_ref().filter(|r| r.logged_in)?;
+        (self.native_lifecycle.epoch() == Some(living.entity().epoch())).then_some(())?;
+        let id = u32::try_from(living.entity().id()).ok()?;
+        remote.tracked(i32::try_from(id).ok()?)?;
+        self.mobs
+            .iter()
+            .any(|m| m.id == id && !m.removed)
+            .then_some(Target::Mob(id))
     }
     /// What a living handle names for a read that works on both sides: the
     /// server's entity, or on a client the local player (`Minecraft.player`),
@@ -541,7 +561,10 @@ impl Game<'_> {
     /// resolves: the hub is out for their action, and other players'
     /// handles read `None` until it is back.
     pub(super) fn living_health(&self, living: LivingRef) -> Option<f32> {
-        match self.native_living_read_target(living)? {
+        let target = self
+            .native_living_read_target(living)
+            .or_else(|| self.native_client_remote_mob(living))?;
+        match target {
             Target::Player => Some(self.player.as_ref()?.health.health()),
             Target::Guest(conn) => Some(self.command_guest(conn)?.health),
             Target::Mob(id) => self
@@ -570,7 +593,9 @@ impl Game<'_> {
     /// armor stand the fixed 20 the game seeds it with, the dragon its
     /// 200) until live attribute maps cover them.
     pub(super) fn living_max_health(&self, living: LivingRef) -> Option<f32> {
-        let target = self.native_living_read_target(living)?;
+        let target = self
+            .native_living_read_target(living)
+            .or_else(|| self.native_client_remote_mob(living))?;
         match target {
             Target::Player | Target::Guest(_) => self
                 .native_target_attribute(

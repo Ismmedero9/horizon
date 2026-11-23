@@ -32,6 +32,7 @@ members = [
     "crates/horizon-client-gameplay",
     "crates/horizon-client-core",
     "crates/horizon-client-input",
+    "crates/horizon-voicechat",
     "crates/horizon-client-render",
     "crates/horizon-command",
     "crates/horizon-items",

@@ -231,6 +231,7 @@ impl Game<'_> {
         frustum: Option<&horizon_client::gfx::JoinedFrusta>,
     ) -> Vec<NameTag> {
         let target = self.mob_hit().map(|(i, _, _)| self.mobs[i].id);
+        let voice = horizon_voicechat::service::icons();
         // Asked once a frame: a mod loaded without this hook costs the tags nothing.
         let name_format = hooks && mod_api::__private::listened(mod_api::HookId::PlayerNameFormat);
         let viewer = self.player_team();
@@ -394,6 +395,16 @@ impl Game<'_> {
                 shown = self.player_text(&name, uuid);
             }
             let shown = shown.resolve_legacy();
+            // Voice chat: a mark before another player's name while they talk, have it off, or are in a group.
+            let shown = match (player, voice.as_ref(), self.remote_player_uuid(m.id)) {
+                (true, Some(v), Some(u)) => {
+                    let mark = if v.disabled.contains(&u) { Some(("\u{00d7} ", 0xFF5555)) }
+                        else if v.talking.contains(&u) { Some(("\u{266a} ", 0x55FF55)) }
+                        else if v.grouped.contains(&u) { Some(("\u{2022} ", 0x55FFFF)) } else { None };
+                    match mark { Some((g, c)) => horizon_client::text::Text::colored(g, c).append(shown), None => shown }
+                }
+                _ => shown,
+            };
             let shown = text
                 .map(|text| Text::untrusted(text).resolve_legacy())
                 .unwrap_or(shown);

@@ -25,6 +25,7 @@ impl Game<'_> {
         let original_keys = [keys.forward, keys.backward, keys.left, keys.right];
         let [mut strafe, mut forward] = keys.direction();
         let original_axes = [strafe, forward];
+        let original_rest = (keys.jump, keys.shift, keys.sprint);
         self.native_movement_input(mod_api::__private::MovementInputCall {
             forward: &mut forward,
             strafe: &mut strafe,
@@ -51,9 +52,14 @@ impl Game<'_> {
             }
             keys.analog = Some([strafe, forward]);
         }
-        // A subscribed listener owns sprint for this tick. Without one, the
-        // vanilla latch and double-tap behavior above are left untouched.
-        keys.sprint_suppressed = !keys.sprint;
+        // A listener that changes the movement input owns sprint for this tick. One that left it
+        // alone (a mod that only reads the keys, or acts in some modes only) must not cost the
+        // player vanilla's sprint latch and double-tap: upstream held sprint off for any enabled
+        // listener whenever the sprint key was up, which broke double-tap W.
+        let changed = [keys.forward, keys.backward, keys.left, keys.right] != original_keys
+            || [strafe, forward] != original_axes
+            || (keys.jump, keys.shift, keys.sprint) != original_rest;
+        keys.sprint_suppressed = changed && !keys.sprint;
         keys
     }
 
