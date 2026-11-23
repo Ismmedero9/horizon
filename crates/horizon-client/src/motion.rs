@@ -4527,6 +4527,31 @@ mod tests {
     /// The speed it starts the tick with is the client's own movement
     /// (`handleMovePlayer` gives the server copy its delta movement), so the
     /// loss is the speed the glide actually flew at.
+    /// `LivingEntity.updateFallFlyingMovement` looking straight down: the look's horizontal part is
+    /// about 1e-16, so only its direction pulls the glide, and a yaw against the motion costs 20% of
+    /// the horizontal speed. Expected values are what the 26.3 jar's own `Entity.calculateViewVector`
+    /// and the glide step give for the same inputs.
+    #[test]
+    fn a_straight_down_glide_follows_the_look_yaw_as_vanilla_does() {
+        let v = Vec3::new(-0.1346, -0.37, -0.4318);
+        let cases: [(f32, f32, [f64; 3]); 6] = [
+            (90.0, 0.0, [-0.11992860115528106, -0.44100000858306865, -0.3399568573271657]),
+            (90.0, 90.0, [-0.1647055475342845, -0.44100000858306865, -0.38473380370616916]),
+            (90.0, 180.0, [-0.11992860115528106, -0.44100000858306865, -0.42951075008517264]),
+            (90.0, -90.0, [-0.07515165477627761, -0.44100000858306865, -0.38473380370616916]),
+            (-90.0, 180.0, [-0.13325400128364562, -0.44100000858306876, -0.4274820041179657]),
+            (60.0, 162.7, [-0.136128736370881, -0.4156425106122112, -0.4367353702601742]),
+        ];
+        for (pitch, yaw, want) in cases {
+            let got = fall_flying_movement(v, pitch, yaw, 0.08);
+            for (axis, (g, w)) in [got.x, got.y, got.z].into_iter().zip(want).enumerate() {
+                assert!(
+                    (g - w).abs() < 1e-12,
+                    "pitch {pitch} yaw {yaw} axis {axis}: {g} != {w}"
+                );
+            }
+        }
+    }
     #[test]
     #[ignore = "daily"]
     fn a_glide_into_a_wall_hurts_by_the_speed_it_lost() {
